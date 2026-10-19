@@ -65,6 +65,21 @@ curl -X POST http://localhost:3000/api/templates/search \
 curl http://localhost:3000/api/templates/simple-counter/1.0.0
 ```
 
+### 5. Query Ownership Audit History
+
+```bash
+curl http://localhost:3000/api/templates/simple-counter/ownership-history
+```
+
+### 6. Transfer Template Ownership
+
+```bash
+curl -X POST http://localhost:3000/api/templates/simple-counter/transfer-ownership \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"new_username": "new_owner"}'
+```
+
 ## Using Docker
 
 ```bash
@@ -119,6 +134,18 @@ starforge registry publish ./my-template \
   --description "My awesome template" \
   --tags "example,educational"
 ```
+
+For shared publishing, create an organization, add a maintainer, and publish
+under its namespace:
+
+```bash
+starforge registry org create stellar-tools --name "Stellar Tools"
+starforge registry org add-member stellar-tools teammate --role maintainer
+starforge registry publish ./my-template --org stellar-tools
+```
+
+Ownership transfers are two-party: the current owner requests a transfer and
+the receiving user or organization admin confirms the returned `transfer_id`.
 
 ### 5. Install template
 

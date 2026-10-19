@@ -1,6 +1,4 @@
-use crate::utils::history::{
-    history_file_path, load_history, prune_history, save_history, HistoryEntry,
-};
+use crate::utils::history::{load_history, prune_history, save_history, HistoryEntry};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -231,10 +229,13 @@ impl AutocompleteEngine {
                 vec!["--horizon-url", "--soroban-rpc-url", "--network-passphrase"]
             }
             "contract" => {
-                vec!["inspect", "invoke", "list"]
+                vec!["build", "inspect", "invoke", "list"]
             }
             "contract inspect" => {
-                vec!["--network"]
+                vec!["--network", "--wasm", "--json"]
+            }
+            "contract build" => {
+                vec!["--manifest-path", "--no-provenance"]
             }
             "contract invoke" => {
                 vec!["--network", "--wallet", "--function", "--args"]

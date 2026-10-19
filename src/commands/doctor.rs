@@ -27,6 +27,40 @@ pub async fn run() -> Result<()> {
     let cfg = config::load()?;
     findings.extend(config::validate_config_integrity(&cfg));
 
+    let target_override = match crate::manifest::find_and_load_manifest(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    ) {
+        Ok(Some((_, manifest))) => manifest.wasm_target,
+        Ok(None) => None,
+        Err(error) => {
+            findings.push(config::DoctorFinding::fail(
+                "wasm_target",
+                format!("could not read starforge.toml: {error:#}"),
+            ));
+            None
+        }
+    };
+
+    match crate::utils::wasm_target::resolve_target(target_override.as_deref()) {
+        Ok(target) => match crate::utils::wasm_target::installed_target(&target) {
+            Ok(true) => findings.push(config::DoctorFinding::pass(
+                "wasm_target",
+                format!("Rust target '{target}' is installed"),
+            )),
+            Ok(false) => findings.push(config::DoctorFinding::fail(
+                "wasm_target",
+                format!(
+                    "Rust target '{target}' is not installed; run `rustup target add {target}`"
+                ),
+            )),
+            Err(error) => findings.push(config::DoctorFinding::fail(
+                "wasm_target",
+                format!("could not check Rust target '{target}': {error:#}"),
+            )),
+        },
+        Err(error) => findings.push(config::DoctorFinding::fail("wasm_target", error.to_string())),
+    }
+
     let network = cfg.network.clone();
     if horizon::check_network(&network).await {
         findings.push(config::DoctorFinding::pass(
@@ -55,6 +89,17 @@ pub async fn run() -> Result<()> {
             }
         }
         Err(e) => findings.push(config::DoctorFinding::fail("soroban", e.to_string())),
+    }
+
+    match soroban::get_protocol_version(&network).await {
+        Ok(protocol_version) => findings.push(config::DoctorFinding::pass(
+            "protocol",
+            format!("Soroban protocol version {protocol_version} detected for '{network}'"),
+        )),
+        Err(e) => findings.push(config::DoctorFinding::fail(
+            "protocol",
+            format!("Soroban protocol version detection failed for '{network}': {e:#}"),
+        )),
     }
 
     if let Some(cli_path) = info::detect_stellar_cli() {

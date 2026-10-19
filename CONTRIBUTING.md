@@ -9,11 +9,15 @@ Welcome to StarForge! This guide will help you get started contributing to the p
 - [Development Setup](#development-setup)
 - [Building the Project](#building-the-project)
 - [Running Tests](#running-tests)
+- [Golden CLI Snapshot Tests](#golden-cli-snapshot-tests)
+- [Documentation Snippets](#documentation-snippets)
 - [Development Workflow](#development-workflow)
 - [Code Quality](#code-quality)
 - [Submitting a Pull Request](#submitting-a-pull-request)
+- [Writing Plugins](#writing-plugins)
 - [Contributing to AI Features](#contributing-to-ai-features)
 - [Common Issues & Troubleshooting](#common-issues--troubleshooting)
+- [Flaky Tests & Quarantine](#flaky-tests--quarantine)
 - [Questions & Support](#questions--support)
 
 ---
@@ -26,7 +30,7 @@ Welcome to StarForge! This guide will help you get started contributing to the p
 4. **Run tests**: `cargo test`
 5. **Create a branch**: `git checkout -b feat/your-feature-name`
 6. **Make changes** and commit with clear messages
-7. **Push and open a Pull Request** against `master`
+7. **Push and open a Pull Request** against the `main` branch
 
 ---
 
@@ -34,7 +38,19 @@ Welcome to StarForge! This guide will help you get started contributing to the p
 
 ### Rust
 
-StarForge requires **Rust 1.80 or later**. 
+StarForge requires **Rust 1.80 or later** (`rust-version` in `Cargo.toml`).
+
+#### MSRV policy
+
+- The Minimum Supported Rust Version (MSRV) tracks approximately **N−3** stable
+  releases (today: 1.80 while latest stable is ~1.83+).
+- MSRV bumps happen only in **minor** StarForge releases, never in patch releases.
+- Exact dependency pins (`=x.y.z`) are avoided unless a justification comment sits
+  next to the pin (usually an MSRV or API-stability hold). Prefer caret ranges and
+  rely on `.cargo/config.toml` `incompatible-rust-versions = "fallback"` plus the
+  weekly `latest-deps` CI job to catch drift.
+- When raising MSRV, update `Cargo.toml` `rust-version`, the `MSRV (Rust …)` CI
+  job, `CONTRIBUTING.md`, and `docs/BRANCH_PROTECTION.md` in the same PR.
 
 #### Install Rust
 
@@ -169,6 +185,51 @@ The project includes quick smoke tests to verify basic functionality:
 cargo test --test cli_smoke
 ```
 
+### Golden CLI Snapshot Tests
+
+`tests/cli_golden.rs` pins the observable output (stdout, stderr, exit code)
+of `starforge` against committed snapshots under `tests/cmd/`. It is a
+dependency-free stand-in for `trycmd`/`snapbox` (those crates are not in
+`Cargo.lock`, and CI asserts the lockfile is unchanged), using the same
+`TRYCMD=overwrite` workflow:
+
+```bash
+# Compare against the committed corpus
+cargo test --locked --test cli_golden
+
+# Intentionally refresh the snapshots (or run: bash scripts/gen-cli-snapshots.sh)
+TRYCMD=overwrite cargo test --locked --test cli_golden
+git diff -- tests/cmd
+```
+
+A case whose snapshot file is missing is generated automatically and passes
+(with a notice), so adding a new `tests/cmd/<case>.toml` never turns CI red
+before its snapshot is committed. Only snapshots whose exact bytes are known
+without running the binary are committed; run the `TRYCMD=overwrite` command
+above to populate the rest of the corpus. See
+[docs/CLI_GOLDEN_TESTS.md](docs/CLI_GOLDEN_TESTS.md) for the full workflow,
+determinism rules, and corpus layout.
+
+### Run Optional-Feature Tests (hardware wallets)
+
+Ledger and Trezor support lives behind the `hardware-wallet` Cargo feature
+and is skipped by the default `cargo test` above. CI compiles and tests it
+in a dedicated `hardware-wallet` job on every push, so run the same command
+locally before touching `src/utils/hardware_wallet.rs`:
+
+```bash
+# Linux: apt-get install -y libudev-dev libusb-1.0-0-dev first
+cargo build --locked --features hardware-wallet
+cargo test --locked --features hardware-wallet
+```
+
+No physical device is required — the tests assert the approval, rejection,
+unsupported-envelope, and disconnected/no-device paths, either against pure
+APDU-parsing logic or against the real `hidapi`/`trezor-client` backends'
+"no device found" behavior. See
+[BUILD_TROUBLESHOOTING.md](BUILD_TROUBLESHOOTING.md#4-feature-flag-issues)
+for per-OS system dependencies.
+
 ### Check Code Quality
 
 The CI pipeline runs several quality checks. Run them locally:
@@ -180,9 +241,120 @@ cargo fmt --all --check
 # Linter check
 cargo clippy -- -D warnings
 
+# Secure defaults audit
+cargo test --test secure_defaults_audit
+# Doctests (compiles examples in doc comments)
+cargo test --doc
+
 # Dependency security check (requires cargo-deny)
 cargo install cargo-deny
 cargo deny check
+```
+
+### Supply-Chain Policy with cargo-deny
+
+StarForge enforces supply-chain security via [cargo-deny](https://github.com/EmbarkStudios/cargo-deny). The configuration lives in `deny.toml` at the repository root and is enforced in CI on every push and pull request.
+
+**What cargo-deny checks:**
+
+| Check | What it enforces |
+|---|---|
+| **Advisories** | Known security vulnerabilities in dependencies (via the RustSec advisory database) |
+| **Licenses** | Only approved open-source licenses are permitted in the dependency tree |
+| **Bans** | Detects duplicate crate versions and blocks specific crates if needed |
+| **Sources** | Only dependencies from crates.io are allowed; no untrusted registries or git sources |
+
+**Running cargo-deny locally:**
+
+```bash
+# Install (if not present)
+cargo install cargo-deny
+
+# Run all checks
+cargo deny check
+
+# Run a specific check
+cargo deny check advisories
+cargo deny check licenses
+cargo deny check bans
+cargo deny check sources
+
+# Run with all features enabled (matches CI)
+cargo deny check --all-features
+```
+
+**When a dependency fails the license policy:**
+
+1. Run `cargo deny check licenses` to identify the crate and its license.
+2. If the license is compatible with MIT (the project's license), add it to the `allow` list in `deny.toml` under `[licenses].allow` with a comment explaining why.
+3. If the license is incompatible or unclear, investigate an alternative crate or seek a maintainer decision before merging.
+
+**When an advisory is detected:**
+
+1. Check the advisory ID (e.g., `RUSTSEC-2024-0388`) at [rustsec.org](https://rustsec.org).
+2. If the vulnerability affects the project, update the dependency to a patched version.
+3. If the vulnerability is in a dev-only dependency or is otherwise mitigated, add the ID to `[advisories].ignore` in `deny.toml` with a rationale comment.
+4. Never silently ignore advisories — every ignore entry must have a documented justification.
+
+**Source/registry violations:**
+
+- The policy denies all registries except crates.io and all git sources.
+- If a new dependency requires a non-crates.io source, it must be explicitly approved and added to `deny.toml` with a rationale.
+- Path dependencies for workspace members are handled separately by the `[graph]` targets configuration.
+
+**Intentional exceptions:**
+
+The project permits narrow, documented exceptions in `deny.toml`:
+- Advisory ignores include the rationale for each skipped RUSTSEC ID.
+- The `ring` crate has a manual license clarification because it lacks a standard license field.
+- Duplicate crate versions are allowed as warnings (not errors) to maintain compatibility while flagging potential improvements.
+
+**Running the configuration tests:**
+
+```bash
+# Validate the deny.toml configuration
+cargo test --test cargo_deny_config
+```
+
+## Documentation Snippets
+
+The shell examples in `README.md` and `docs/` are checked in CI by the **Docs
+Snippets** job ([`scripts/docs-snippets.py`](scripts/docs-snippets.py)). Every
+shell code block (`bash`, `sh`, `shell`, `console`, `powershell`, ...) must say
+whether it runs, with a word after the language on the opening fence:
+
+| Fence | Meaning |
+|---|---|
+| `` ```bash run `` | Executed in CI and must exit 0. |
+| `` ```bash run fails `` | Executed and must exit **non-zero**. Use it to document an error. |
+| `` ```bash run local `` | Executed only when a local network is available (`--local-network`). |
+| `` ```bash norun `` | Never executed. Use it for snippets that need secrets, funded accounts, mainnet, Docker, hardware wallets, Ollama, or placeholder values like `<CONTRACT_ID>`. |
+
+GitHub still highlights `` ```bash run `` as Bash. An unannotated shell block
+fails the job, and so does an untagged block containing a `starforge` command.
+
+How `run` blocks execute:
+
+- Each Markdown file gets a fresh temporary `HOME` and working directory. Its
+  `run` blocks execute **in order** in that sandbox, so a later block can use
+  a wallet or project that an earlier block created.
+- Each block runs as `bash -euo pipefail` with the just-built `starforge`
+  first on `PATH` and `STARFORGE_NON_INTERACTIVE=1`, so a command waiting on a
+  prompt fails instead of hanging.
+- In `console` blocks, only lines that start with `$ ` run. Other lines are
+  treated as sample output.
+- Failures are reported as `path:line` and shown as annotations on the PR.
+
+Prefer `run` whenever a snippet can work offline. If a command needs the
+network, put a runnable offline variant next to it (for example `--help` or
+`--dry-run`) instead of marking everything `norun`.
+
+```bash norun
+cargo build
+python3 scripts/docs-snippets.py                     # lint + run README.md and docs/
+python3 scripts/docs-snippets.py docs/USAGE.md       # a single file
+python3 scripts/docs-snippets.py --lint-only         # annotations only, no build needed
+python3 scripts/docs-snippets.py --try-unannotated docs/NEW.md   # triage new docs
 ```
 
 ---
@@ -287,15 +459,25 @@ git push origin feat/issue-XXX-description
 
 Then open a Pull Request on GitHub. Use the provided template and follow the checklist.
 
+### 8. Architectural Changes & ADRs
+
+If your PR introduces or alters major architectural patterns (such as client binding formats, plugin ABIs, telemetry defaults, simulation engines, or storage schemas), you must include an **Architecture Decision Record (ADR)**.
+- See the [ADR Index and Process](docs/adr/README.md).
+- Copy [`docs/adr/template.md`](docs/adr/template.md) and record the context, considered options, and decision outcomes.
+
 ---
 
-## Code Quality and Security Logging
+## Code Quality, Security, and Incident Response
 
 StarForge enforces consistent code quality through automated CI checks. See [CI_ENFORCEMENT.md](CI_ENFORCEMENT.md) for full details.
 
-### Security Logging Requirements
+### Security Logging and Incident Response Requirements
 
-All security-relevant operations must be properly logged for auditability and debugging. See [SECURITY_LOGGING_GUIDE.md](SECURITY_LOGGING_GUIDE.md) for detailed requirements. Key principles:
+All security-relevant operations must be properly logged for auditability and debugging:
+- See [SECURITY_LOGGING_GUIDE.md](SECURITY_LOGGING_GUIDE.md) for logging standards.
+- In the event of suspected secret key or credential leakage, immediately follow the [Incident Response Runbook](docs/SECURITY_INCIDENT_RUNBOOK.md).
+
+Key principles:
 
 - **Log all security operations** - Wallet creation, encryption, deployment, plugin loading, etc.
 - **Never log secrets** - Private keys, passphrases, encryption keys must be redacted
@@ -364,7 +546,8 @@ For detailed code style expectations, see [CODE_STYLE_STANDARDS.md](CODE_STYLE_S
 /// # Returns
 /// Description of return value
 ///
-/// # Example
+/// # Examples
+///
 /// ```
 /// let result = my_function(42);
 /// assert_eq!(result, 43);
@@ -374,6 +557,7 @@ pub fn my_function(arg1: i32) -> i32 {
 }
 ```
 
+- **Add compilable doctests** to public utility functions (see [DOCTEST_GUIDELINES.md](DOCTEST_GUIDELINES.md))
 - Keep README and other docs up-to-date with your changes
 - Update CHANGELOG if your change is user-facing
 
@@ -385,27 +569,97 @@ Run this before every commit to catch issues early:
 cargo fmt --all && \
   cargo build --locked && \
   cargo test --locked && \
+  cargo test --doc --locked && \
   cargo clippy --locked -- -D warnings
 ```
 
-All of these are checked in CI.
+All of these are checked in CI. See [DOCTEST_GUIDELINES.md](DOCTEST_GUIDELINES.md) for how to write and maintain doctests.
 
 ---
 
 ## Submitting a Pull Request
 
+### Branch Protection & Merge Requirements
+
+StarForge enforces strict branch protections on the `master` branch to guarantee codebase stability, correctness, and security.
+
+> **A pull request is merged only when every required CI check is green on its latest commit _and_ the branch has no merge conflicts with `master`.** The authoritative list of required checks, and how maintainers configure them, is in [docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md).
+
+#### 1. Required CI Status Checks
+Every Pull Request must achieve passing status on all required CI checks before it can be merged. The required status checks are:
+
+| CI Job | Purpose | Command / Verification |
+|--------|---------|------------------------|
+| **Rustfmt** | Code formatting standards | `cargo fmt --all --check` |
+| **MSRV (Rust 1.80)** | Rust 1.80 MSRV compilation | `cargo check --locked --workspace` |
+| **Cargo Deny** | Dependency security & license audit | `cargo deny check --all-features` |
+| **Secure Defaults Audit** | Security-sensitive defaults stay safe | `cargo test --test secure_defaults_audit --locked` |
+| **Documentation Tests** | Doc examples compile and pass | `cargo test --doc --locked` |
+| **Feature Matrix** | Full build, JSON contract stability & test suite across feature combinations (default, no-default, ai, hardware) | `cargo build`, `cargo test` with various `--features` |
+| **Docs Cheat Sheet (anti-drift)** | Generated command cheat sheet is current | `cargo build --locked` then `git diff --exit-code -- docs/COMMAND_CHEATSHEET.md` |
+| **Clippy Lint** | Zero lint warnings allowed | `cargo clippy --all-features --locked -- -D warnings` |
+| **CLI Smoke Tests (Linux)** | End-to-end CLI integration | `cli_cross_platform`, `cli_smoke`, `scripts/e2e-smoke.sh` |
+| **macOS CLI Tests** / **Windows CLI Tests** | Cross-platform CLI validation | `cli_cross_platform`, `cli_smoke` |
+
+#### 2. Conflict-Free Requirement
+- All PRs must have **zero merge conflicts** against `master`; GitHub blocks the merge button while conflicts exist.
+- PR branches must be rebased on the latest `master` before merge.
+- If conflicts arise during review, rebase locally and force-push to your PR branch:
+  ```bash
+  git fetch origin
+  git rebase origin/master
+  # Resolve any conflicts
+  git push --force-with-lease origin feat/your-branch
+  ```
+
+#### 3. Code Review & Approvals
+- PRs require at least one approving review from a project maintainer.
+- All review conversations must be resolved before merging.
+
+---
+
+### Local Preflight Verification (`scripts/preflight-pr.sh`)
+
+To avoid CI failures and ensure your PR passes all merge gates on the first try, run the local preflight script:
+
+```bash
+# Run standard merge gate checks
+./scripts/preflight-pr.sh
+
+# Run quick checks (fmt, clippy, unit tests, JSON contract)
+./scripts/preflight-pr.sh --quick
+
+# Auto-format and verify
+./scripts/preflight-pr.sh --fix
+
+# Run full test suite
+./scripts/preflight-pr.sh --all
+```
+
+The script automatically executes:
+1. **Git hygiene & conflict check**: Fails on unresolved conflict markers, an in-progress merge/rebase, or a trial merge into `origin/master` that would conflict
+2. **Rustfmt**: Verifies all code matches formatting standards
+3. **Workspace check**: Verifies compilation across the entire workspace
+4. **Clippy**: Verifies zero warnings with `--all-features -- -D warnings`, exactly as CI runs it
+5. **Contract stability**: Verifies JSON contract schema invariants
+6. **Secure defaults audit**: Runs `secure_defaults_audit`
+7. **Tests**: Executes unit and smoke tests (`--all` adds the full suite, doctests, and cross-platform CLI tests)
+8. **Drift checks**: Fails if the build changes `docs/COMMAND_CHEATSHEET.md` or `Cargo.lock`
+9. **Cargo Deny**: Audits dependencies for vulnerabilities and license issues (if `cargo-deny` is installed)
+
+The script exits with a **non-zero status code** if any check fails, reporting exactly which gate needs attention.
+
+---
+
 ### Before Submitting
 
 - [ ] Fork and clone the repository
-- [ ] Create a feature branch
-- [ ] Make your changes
-- [ ] Add/update tests
-- [ ] Run `cargo test` and verify all tests pass
-- [ ] Run `cargo fmt --all`
-- [ ] Run `cargo clippy -- -D warnings`
-- [ ] Update relevant documentation
-- [ ] Commit with clear messages
-- [ ] Push to your fork
+- [ ] Create a feature branch (`git checkout -b feat/your-feature`)
+- [ ] Make your changes and add/update tests
+- [ ] Run `./scripts/preflight-pr.sh` and ensure all gates pass (exit code `0`)
+- [ ] Verify branch is rebased on latest `master` with no conflicts
+- [ ] Update relevant documentation if applicable
+- [ ] Commit with clear messages and push to your fork
 
 ### Pull Request Checklist
 
@@ -416,21 +670,42 @@ When opening a PR, fill out the template with:
 - **Related Issues**: Link to issue(s) being resolved (e.g., `closes #208`)
 - **Tests**: Describe any tests added/modified
 - **Checklist**:
-  - [ ] Code follows style guidelines
+  - [ ] Code follows style guidelines (`cargo fmt`)
   - [ ] Self-reviewed own code
   - [ ] Added tests for new functionality
-  - [ ] All tests pass locally (`cargo test`)
+  - [ ] Passed local preflight checks (`./scripts/preflight-pr.sh`)
+  - [ ] All CI status checks passing
+  - [ ] No merge conflicts with `master`
   - [ ] Updated documentation if needed
   - [ ] No breaking changes (or clearly documented)
 
 ### PR Guidelines
 
+- **Pass All CI Gates**: PRs cannot merge unless every required status check in [docs/BRANCH_PROTECTION.md](docs/BRANCH_PROTECTION.md) is green on the latest commit.
+- **Ensure No Conflicts**: Keep your branch up to date with `master`.
+- **Run Preflight Locally**: Always execute [`./scripts/preflight-pr.sh`](scripts/preflight-pr.sh) before opening or updating a PR; it exits non-zero when any merge gate fails.
 - **Keep PRs focused**: One issue per PR when possible
 - **Keep PRs scoped**: Smaller, focused PRs are easier to review and merge faster
 - **Write clear descriptions**: Explain the "why" not just the "what"
 - **Reference issues**: Use `closes #XXX` to automatically link issues
 - **Test thoroughly**: Include test cases for both happy path and edge cases
 - **Update docs**: If your changes affect user-facing behavior, update docs
+
+---
+
+## Writing Plugins
+
+Building a StarForge plugin, or changing one of the example plugins? Start with
+the [plugin authoring cookbook](docs/plugins/cookbook.md). It walks through a
+hello-world plugin, capabilities, testing, signing, trust metadata, publishing
+and ABI compatibility, using the example plugins in
+[`examples/plugins/`](examples/plugins/). CI builds and tests those examples in
+the **Plugin Cookbook Examples** job; run the same check locally with:
+
+```bash
+cp Cargo.lock examples/plugins/Cargo.lock
+cargo test --manifest-path examples/plugins/Cargo.toml --workspace
+```
 
 ---
 
@@ -531,6 +806,71 @@ This document confirms:
 
 ---
 
+## Flaky Tests & Quarantine
+
+A **flaky test** is one that fails and then passes when it is retried. Flakes
+waste reviewer time and train people to ignore red CI, so StarForge runs the
+test suite through [`cargo nextest`](https://nexte.st) with retries enabled
+(see [`.config/nextest.toml`](.config/nextest.toml)) and reports every test that
+passed only on a retry.
+
+### Detecting flakes
+
+The [Flaky Test Detection workflow](.github/workflows/flaky-tests.yml) runs
+nightly and on pull requests that touch the test suite. It publishes two
+artifacts:
+
+| Artifact | Contents |
+|---|---|
+| `flaky-test-report-nextest` | `flaky-report.md` and `flaky-report.json` — the tests that passed only on a retry |
+| `nextest-junit-report` | The raw nextest JUnit XML (`target/nextest/ci/junit.xml`) |
+
+Run the same detection locally:
+
+```bash
+cargo install cargo-nextest --locked          # once
+cargo nextest run --profile ci                # retries failures, writes JUnit XML
+python3 scripts/flaky-report.py               # writes flaky-report.md + flaky-report.json
+```
+
+### Quarantine process
+
+When a flake cannot be fixed in the same pull request, quarantine it by adding
+one entry to [`.github/flaky-quarantine.json`](.github/flaky-quarantine.json):
+
+```json
+{
+  "test": "starforge::utils::wallet::creates_wallet_from_seed",
+  "owner": "@your-github-handle",
+  "issue": 924,
+  "quarantinedOn": "2026-09-26",
+  "deadline": "2026-10-26",
+  "reason": "Intermittent filesystem timing on the CI runner."
+}
+```
+
+The rules are intentionally strict so quarantines do not become permanent:
+
+1. **Every entry names one owner and one deadline.** `test` is the full nextest
+   id from `flaky-report.md`; `owner` is a GitHub handle (`@name`); `deadline`
+   is an ISO date (`YYYY-MM-DD`).
+2. **The deadline is at most 30 days out.** Longer-lived flakes should be fixed,
+   not hidden.
+3. **Quarantined tests still run.** Quarantine marks the flake as known and
+   assigns accountability; it does not delete or skip coverage. The report
+   lists each flake next to its owner and deadline.
+4. **Expired entries are escalated.** Once the deadline passes, the flaky
+   report marks the entry `expired` and the owner must fix the test,
+   re-quarantine it with a new deadline and a tracking issue, or remove it with
+   a justification in the pull request.
+5. **Fixes beat quarantines.** When you fix a flake, add deterministic coverage
+   for the failure mode and delete its entry in the same pull request.
+
+Reviewers should reject a quarantine entry that is missing an owner, a deadline,
+or a linked tracking issue.
+
+---
+
 ## Questions & Support
 
 - **Documentation**: See [DEVELOPER_GUIDE.md](DEVELOPER_GUIDE.md) for in-depth development topics
@@ -546,3 +886,4 @@ This document confirms:
 Contributors are recognized in the project and may participate in the [Stellar Wave Program](https://www.drips.network/wave/stellar) for monetary rewards.
 
 Thank you for contributing to StarForge! 🚀
+.....

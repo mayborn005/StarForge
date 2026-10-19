@@ -36,6 +36,10 @@ const COMMANDS: &[CmdEntry] = &[
                 "Import a wallet from a backup file, BIP39 phrase, or raw secret key",
             ),
             (
+                "import-shares",
+                "Reconstruct a wallet backup from recovery shares",
+            ),
+            (
                 "connect",
                 "Connect to a hardware wallet (Ledger/Trezor) and show device info",
             ),
@@ -92,10 +96,11 @@ const COMMANDS: &[CmdEntry] = &[
     },
     CmdEntry {
         name: "contract",
-        about: "Contract operations (invoke, inspect, etc.)",
+        about: "Contract operations (invoke, inspect, ttl, etc.)",
         subs: &[
             ("invoke", "Invoke a deployed contract function"),
             ("inspect", "Inspect a compiled contract .wasm file"),
+            ("ttl", "Inspect and extend ledger-entry TTLs"),
         ],
     },
     CmdEntry {

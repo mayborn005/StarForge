@@ -9,15 +9,8 @@
 //! - `risk`      – Assess and mitigate project risks using AI analysis
 //! - `timeline`  – Manage project timelines, milestones, and deadlines
 
-use crate::utils::{config, ollama, print as p};
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use anyhow::Result;
 use clap::{Args, Subcommand};
-use colored::*;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
 
 // ─── Top-level Subcommand ──────────────────────────────────────────
 
@@ -41,6 +34,12 @@ pub enum ProjectCommands {
     /// Manage project timelines, milestones, and deadlines
     #[command(subcommand)]
     Timeline(TimelineCommands),
+    /// Generate Soroban project boilerplate
+    #[command(subcommand)]
+    New(crate::commands::new::NewCommands),
+    /// AI-driven collaboration: code review, conflict resolution, knowledge sharing
+    #[command(subcommand)]
+    Collab(crate::commands::collab::CollabCommands),
 }
 
 // ══════════════════════════════════════════════════════════════════
@@ -309,7 +308,14 @@ pub struct WorkloadArgs {
     pub project: Option<String>,
 }
 
-pub async fn handle(_cmd: ProjectCommands) -> Result<()> {
-    println!("Project command is under construction.");
-    Ok(())
+pub async fn handle(cmd: ProjectCommands) -> Result<()> {
+    match cmd {
+        // ADR 0007: forward the commands that moved under `project`.
+        ProjectCommands::New(cmd) => crate::commands::new::handle(cmd).await,
+        ProjectCommands::Collab(cmd) => crate::commands::collab::handle(cmd).await,
+        _ => {
+            println!("Project command is under construction.");
+            Ok(())
+        }
+    }
 }
