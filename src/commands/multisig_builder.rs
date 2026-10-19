@@ -1,4 +1,4 @@
-use crate::utils::{multisig_builder as multisig, print as p};
+use crate::utils::{multisig_audit, multisig_builder as multisig, print as p};
 use anyhow::Result;
 use clap::Subcommand;
 use colored::Colorize;
@@ -26,6 +26,12 @@ pub enum MultisigCommands {
         /// Transaction network
         #[arg(long, default_value = "testnet")]
         network: String,
+        /// Mandatory timelock delay in seconds before execution is allowed
+        #[arg(long)]
+        timelock_delay: Option<u64>,
+        /// Optional execution window in seconds after unlock
+        #[arg(long)]
+        execution_window: Option<u64>,
     },
     /// Add a signer to proposal
     AddSigner {
@@ -39,8 +45,7 @@ pub enum MultisigCommands {
         /// Proposal file path
         proposal: PathBuf,
         /// Signer wallet name
-        #[arg(long, short)]
-        wallet: String,
+        signer: String,
     },
     /// View proposal details and signatures
     View {
@@ -70,7 +75,6 @@ pub enum MultisigCommands {
         /// Proposal file path
         proposal: PathBuf,
         /// Output file path
-        #[arg(long, short)]
         output: Option<PathBuf>,
     },
     /// Import proposal from JSON
@@ -78,8 +82,13 @@ pub enum MultisigCommands {
         /// JSON file path
         input: PathBuf,
         /// Output proposal file path
-        #[arg(long, short)]
         output: Option<PathBuf>,
+        /// Expected network for the offline payload
+        #[arg(long)]
+        network: Option<String>,
+        /// Expected SHA-256 payload hash
+        #[arg(long)]
+        hash: Option<String>,
     },
     /// Send signature request notifications
     Notify {
@@ -102,7 +111,6 @@ pub enum MultisigCommands {
         /// Template name
         template: String,
         /// Output file path
-        #[arg(long, short)]
         output: PathBuf,
     },
     /// Validate a proposal for impossible thresholds, duplicate signers, and
@@ -114,6 +122,23 @@ pub enum MultisigCommands {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect an account's signer set, diff it against the last known state,
+    /// and record any signer/threshold changes to the append-only audit log
+    SignerWatch {
+        /// Stellar account ID (G...)
+        #[arg(long)]
+        account: String,
+        /// Network name (testnet, mainnet, custom)
+        #[arg(long, default_value = "testnet")]
+        network: String,
+        /// Enable monitoring: alerts on changes that do not match the baseline
+        #[arg(long)]
+        monitoring: bool,
+        /// Path to a baseline JSON file describing the expected signer set
+        /// and/or thresholds
+        #[arg(long)]
+        baseline: Option<PathBuf>,
+    },
 }
 
 pub async fn handle(cmd: MultisigCommands) -> Result<()> {
@@ -123,15 +148,28 @@ pub async fn handle(cmd: MultisigCommands) -> Result<()> {
             threshold,
             signers,
             network,
-        } => create_proposal(threshold, &signers, &network),
+            timelock_delay,
+            execution_window,
+        } => create_proposal(
+            threshold,
+            &signers,
+            &network,
+            timelock_delay,
+            execution_window,
+        ),
         MultisigCommands::AddSigner { proposal, signer } => add_signer(&proposal, &signer),
-        MultisigCommands::Sign { proposal, wallet } => sign_proposal(&proposal, &wallet),
+        MultisigCommands::Sign { proposal, signer } => sign_proposal(&proposal, &signer),
         MultisigCommands::View { proposal } => view_proposal(&proposal),
         MultisigCommands::Status { proposal } => check_status(&proposal),
         MultisigCommands::IsReady { proposal } => is_ready(&proposal),
         MultisigCommands::Submit { proposal, network } => submit_proposal(&proposal, &network),
         MultisigCommands::Export { proposal, output } => export_proposal(&proposal, output),
-        MultisigCommands::Import { input, output } => import_proposal(&input, output),
+        MultisigCommands::Import {
+            input,
+            output,
+            network,
+            hash,
+        } => import_proposal(&input, output, network.as_deref(), hash.as_deref()),
         MultisigCommands::Notify {
             proposal,
             channel,
@@ -141,6 +179,12 @@ pub async fn handle(cmd: MultisigCommands) -> Result<()> {
         MultisigCommands::Templates => list_templates(),
         MultisigCommands::FromTemplate { template, output } => from_template(&template, &output),
         MultisigCommands::Validate { proposal, json } => validate_proposal(&proposal, json),
+        MultisigCommands::SignerWatch {
+            account,
+            network,
+            monitoring,
+            baseline,
+        } => signer_watch(&account, &network, monitoring, baseline.as_deref()).await,
     }
 }
 
@@ -286,7 +330,13 @@ fn run_interactive_loop(proposal_path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn create_proposal(threshold: u32, signers: &str, network: &str) -> Result<()> {
+fn create_proposal(
+    threshold: u32,
+    signers: &str,
+    network: &str,
+    timelock_delay: Option<u64>,
+    execution_window: Option<u64>,
+) -> Result<()> {
     p::info(&format!(
         "Creating {}-of-{} multi-sig proposal",
         threshold,
@@ -299,7 +349,10 @@ fn create_proposal(threshold: u32, signers: &str, network: &str) -> Result<()> {
         anyhow::bail!("Threshold cannot exceed number of signers");
     }
 
-    let proposal = multisig::Proposal::new(threshold, signer_list, network.to_string());
+    let mut proposal = multisig::Proposal::new(threshold, signer_list, network.to_string());
+    if let Some(delay) = timelock_delay {
+        proposal = proposal.with_timelock(delay, execution_window);
+    }
     let filename = format!("proposal_{}.json", uuid::Uuid::new_v4());
 
     save_proposal(std::path::Path::new(&filename), &proposal)?;
@@ -308,6 +361,12 @@ fn create_proposal(threshold: u32, signers: &str, network: &str) -> Result<()> {
     println!("  Proposal: {}", colored::Colorize::cyan(filename.as_str()));
     println!("  Threshold: {}/{}", threshold, signers.split(',').count());
     println!("  Network: {}", network);
+    if let Some(delay) = timelock_delay {
+        println!("  Timelock Delay: {}s", delay);
+        if let Some(window) = execution_window {
+            println!("  Execution Window: {}s", window);
+        }
+    }
     println!();
 
     p::success(&format!("Proposal created: {}", filename));
@@ -337,11 +396,12 @@ fn sign_proposal(proposal_path: &std::path::Path, wallet: &str) -> Result<()> {
 
     p::info(&format!("Signing proposal with wallet '{}'", wallet));
 
-    let signature = multisig::generate_signature(&proposal.id, wallet)?;
+    proposal.validate_payload(None, None)?;
+    let signature = multisig::generate_proposal_signature(wallet, &proposal)?;
     if !multisig::validate_signature_format(&signature) {
         anyhow::bail!("Generated signature failed format validation");
     }
-    if !multisig::verify_signature(&proposal.id, wallet, &signature) {
+    if !multisig::verify_proposal_signature(&proposal, wallet, &signature) {
         anyhow::bail!("Signature self-verification failed");
     }
 
@@ -372,6 +432,45 @@ fn print_proposal_summary(proposal: &multisig::Proposal) {
     );
     println!("  Network:   {}", proposal.network);
     println!("  Status:    {}", proposal.get_status());
+    if let Some(ref tl) = proposal.timelock {
+        println!("  Timelock Delay: {}s", tl.min_delay_seconds);
+        if let Some(ref un) = tl.unlock_at {
+            println!("  Unlock At:      {}", un);
+        }
+        if let Some(ref exp) = tl.expires_at {
+            println!("  Expires At:     {}", exp);
+        }
+        if let Some(status) = proposal.timelock_status() {
+            let status_str = match status {
+                multisig::TimelockExecutionStatus::CollectingSignatures { signed, required } => {
+                    format!("Collecting signatures ({}/{})", signed, required)
+                }
+                multisig::TimelockExecutionStatus::Locked {
+                    unlock_at,
+                    remaining_seconds,
+                } => {
+                    format!(
+                        "LOCKED (unlocks at {}, {}s remaining)",
+                        unlock_at, remaining_seconds
+                    )
+                }
+                multisig::TimelockExecutionStatus::ReadyToExecute {
+                    expires_at,
+                    remaining_window_seconds,
+                } => {
+                    if let Some(rem) = remaining_window_seconds {
+                        format!("READY TO EXECUTE (window expires in {}s)", rem)
+                    } else {
+                        "READY TO EXECUTE".to_string()
+                    }
+                }
+                multisig::TimelockExecutionStatus::Expired { expired_at } => {
+                    format!("EXPIRED at {}", expired_at)
+                }
+            };
+            println!("  Execution:      {}", status_str);
+        }
+    }
     println!();
 }
 
@@ -411,7 +510,7 @@ fn view_proposal(proposal_path: &std::path::Path) -> Result<()> {
     println!();
     println!("{}", colored::Colorize::cyan("═══ SIGNATURES ═══"));
     for sig in &proposal.signatures {
-        let verified = multisig::verify_signature(&proposal.id, &sig.signer, &sig.signature);
+        let verified = multisig::verify_proposal_signature(&proposal, &sig.signer, &sig.signature);
         let marker = if verified {
             colored::Colorize::green("✓")
         } else {
@@ -472,22 +571,19 @@ fn check_status(proposal_path: &std::path::Path) -> Result<()> {
 
 fn is_ready(proposal_path: &std::path::Path) -> Result<()> {
     let proposal = load_proposal(proposal_path)?;
-    match multisig::validate_for_submit(&proposal) {
-        Ok(()) => {
-            print!("ready");
-            io::stdout().flush()?;
-            Ok(())
-        }
-        Err(_) => {
-            exit(1);
-        }
+    if multisig::validate_for_submit(&proposal).is_err() || proposal.can_execute().is_err() {
+        exit(1);
     }
+    print!("ready");
+    io::stdout().flush()?;
+    Ok(())
 }
 
 fn submit_proposal(proposal_path: &std::path::Path, network: &str) -> Result<()> {
     let proposal = load_proposal(proposal_path)?;
 
     multisig::validate_for_submit(&proposal)?;
+    proposal.can_execute()?;
 
     p::info(&format!("Submitting proposal to {}", network));
     println!(
@@ -508,7 +604,10 @@ fn submit_proposal(proposal_path: &std::path::Path, network: &str) -> Result<()>
 }
 
 fn export_proposal(proposal_path: &std::path::Path, output: Option<PathBuf>) -> Result<()> {
-    let proposal = load_proposal(proposal_path)?;
+    let mut proposal = load_proposal(proposal_path)?;
+    proposal.validate_payload(None, None)?;
+    proposal.payload_hash = Some(proposal.payload_hash());
+    proposal.signatures.clear();
 
     let output_file = output.unwrap_or_else(|| {
         PathBuf::from(format!(
@@ -524,8 +623,15 @@ fn export_proposal(proposal_path: &std::path::Path, output: Option<PathBuf>) -> 
     Ok(())
 }
 
-fn import_proposal(input_path: &std::path::Path, output: Option<PathBuf>) -> Result<()> {
-    let proposal = load_proposal(input_path)?;
+fn import_proposal(
+    input_path: &std::path::Path,
+    output: Option<PathBuf>,
+    expected_network: Option<&str>,
+    expected_hash: Option<&str>,
+) -> Result<()> {
+    let mut proposal = load_proposal(input_path)?;
+    proposal.validate_payload(expected_network, expected_hash)?;
+    proposal.payload_hash = Some(proposal.payload_hash());
 
     let output_file =
         output.unwrap_or_else(|| PathBuf::from(format!("proposal_{}.json", uuid::Uuid::new_v4())));
@@ -672,6 +778,115 @@ fn from_template(template: &str, output: &std::path::Path) -> Result<()> {
     println!();
 
     p::success(&format!("Proposal created: {}", output.display()));
+
+    Ok(())
+}
+
+fn print_signer_diff(diff: &multisig_audit::SignerSetDiff) {
+    for signer in &diff.added {
+        println!(
+            "  {} {} (weight {})",
+            "+".green().bold(),
+            signer.public_key,
+            signer.weight
+        );
+    }
+    for signer in &diff.removed {
+        println!(
+            "  {} {} (weight {})",
+            "-".red().bold(),
+            signer.public_key,
+            signer.weight
+        );
+    }
+    for change in &diff.weights_changed {
+        println!(
+            "  {} weight change {}: {} -> {}",
+            "±".yellow().bold(),
+            change.public_key,
+            change.old_weight,
+            change.new_weight
+        );
+    }
+    for change in &diff.thresholds_changed {
+        println!(
+            "  {} {} threshold: {} -> {}",
+            "±".yellow().bold(),
+            change.level,
+            change.old_value,
+            change.new_value
+        );
+    }
+    if let Some((old, new)) = diff.master_weight_changed {
+        println!(
+            "  {} master weight: {} -> {}",
+            "±".yellow().bold(),
+            old,
+            new
+        );
+    }
+}
+
+/// `starforge multisig signer-watch` — inspect an account's signer set, diff it
+/// against the last known snapshot, and append any changes to the audit log.
+async fn signer_watch(
+    account: &str,
+    network: &str,
+    monitoring: bool,
+    baseline_path: Option<&std::path::Path>,
+) -> Result<()> {
+    let baseline = match baseline_path {
+        Some(path) => {
+            let contents = std::fs::read_to_string(path)?;
+            Some(serde_json::from_str::<multisig_audit::MonitoringBaseline>(
+                &contents,
+            )?)
+        }
+        None => None,
+    };
+
+    p::header("Multisig Signer Audit");
+    p::kv("Account", account);
+    p::kv("Network", network);
+    if monitoring {
+        p::kv("Monitoring", "enabled");
+    }
+
+    let current = multisig_audit::fetch_signer_state(account, network).await?;
+    let outcome = multisig_audit::inspect_signer_set(&current, baseline.as_ref(), monitoring)?;
+
+    println!();
+    if !outcome.changed {
+        p::info("No signer or threshold changes detected");
+    } else {
+        p::info(&format!(
+            "Detected {} change(s) since the last known state",
+            outcome.diff.added.len()
+                + outcome.diff.removed.len()
+                + outcome.diff.weights_changed.len()
+                + outcome.diff.thresholds_changed.len()
+        ));
+        print_signer_diff(&outcome.diff);
+        p::success("Audit log updated");
+
+        if outcome.alert {
+            println!();
+            for alert in &outcome.alerts {
+                println!("  {} {}", "⚠".yellow().bold(), alert.yellow());
+            }
+            println!();
+            p::warn("Unexpected multisig configuration change detected");
+        }
+    }
+    println!();
+    p::kv("Signers", &current.signers.len().to_string());
+    p::kv(
+        "Thresholds",
+        &format!(
+            "{}/{}/{}",
+            current.thresholds.low, current.thresholds.medium, current.thresholds.high
+        ),
+    );
 
     Ok(())
 }

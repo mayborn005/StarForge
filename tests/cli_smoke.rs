@@ -9,8 +9,15 @@ fn isolated_home() -> tempfile::TempDir {
 fn starforge(home: &std::path::Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_starforge"));
     cmd.arg("-q");
-    cmd.env("HOME", home);
+    cmd.env("STARFORGE_HOME", home);
     cmd.env("USERPROFILE", home);
+    // HOME / USERPROFILE alone do not isolate the CLI on Windows, where
+    // `dirs::home_dir()` resolves through SHGetKnownFolderPath(FOLDERID_Profile)
+    // and ignores both. Without this, every test in this file shares the one
+    // real config directory, and the tests that mutate networks concurrently
+    // clobber each other. Set explicitly rather than inherited so a
+    // STARFORGE_CONFIG_DIR already in the environment cannot deisolate the run.
+    cmd.env("STARFORGE_CONFIG_DIR", home.join(".starforge"));
     cmd
 }
 
@@ -68,6 +75,146 @@ fn network_show_exits_zero() {
 }
 
 #[test]
+fn network_show_json_uses_stable_envelope() {
+    let home = isolated_home();
+    let output = starforge(home.path())
+        .args(["--json", "network", "show"])
+        .output()
+        .expect("spawn network show --json");
+    assert_success(&output, "starforge --json network show");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON output");
+    assert_eq!(parsed["version"], 1);
+    assert_eq!(parsed["ok"], true);
+    assert!(parsed["data"].is_object());
+}
+
+#[test]
+fn inherited_json_env_preserves_global_output_mode() {
+    let home = isolated_home();
+    let output = starforge(home.path())
+        .args(["network", "show"])
+        .env("STARFORGE_OUTPUT_JSON", "1")
+        .output()
+        .expect("spawn network show with inherited JSON env");
+    assert_success(&output, "starforge network show with inherited JSON env");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout).expect("valid JSON output from env");
+    assert_eq!(parsed["version"], 1);
+    assert_eq!(parsed["ok"], true);
+    assert!(parsed["data"].is_object());
+}
+
+#[test]
+fn plain_flag_replaces_symbol_with_ascii_label_and_strips_ansi() {
+    let home = isolated_home();
+    let output = starforge(home.path())
+        .args(["--plain", "config", "db", "init"])
+        .output()
+        .expect("spawn config db init --plain");
+    assert_success(&output, "starforge --plain config db init");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[OK]"),
+        "plain mode must print the ASCII success label: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains('✓'),
+        "plain mode must not print the decorative success symbol: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "plain mode must not emit ANSI escape codes: {stdout:?}"
+    );
+}
+
+#[test]
+fn no_color_env_enables_plain_mode_without_the_flag() {
+    let home = isolated_home();
+    let output = starforge(home.path())
+        .args(["config", "db", "init"])
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("spawn config db init with NO_COLOR");
+    assert_success(&output, "starforge config db init with NO_COLOR=1");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("[OK]"),
+        "NO_COLOR must trigger the same plain output: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains('\u{1b}'),
+        "NO_COLOR must suppress ANSI escapes: {stdout:?}"
+    );
+}
+
+#[test]
+fn without_plain_or_no_color_the_decorative_symbol_is_used() {
+    let home = isolated_home();
+    let output = starforge(home.path())
+        .args(["config", "db", "init"])
+        .output()
+        .expect("spawn config db init");
+    assert_success(&output, "starforge config db init");
+
+    // `colored` may itself suppress ANSI escapes when stdout is a pipe
+    // rather than a TTY (as it always is under `Command::output()`), so
+    // this only asserts the *symbol* choice, not color: the plain-mode
+    // ASCII label must not appear when nothing asked for plain mode.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains('✓'),
+        "default mode must use the decorative symbol: {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("[OK]"),
+        "default mode must not fall back to the plain-mode label: {stdout:?}"
+    );
+}
+
+#[test]
+fn invalid_network_switch_json_returns_error_envelope() {
+    let home = isolated_home();
+    let output = starforge(home.path())
+        .args(["--json", "network", "switch", "does-not-exist-xyz"])
+        .output()
+        .expect("spawn network switch with invalid target");
+
+    assert!(!output.status.success(), "invalid network should fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(&stderr).expect("error JSON output");
+    assert_eq!(parsed["version"], 1);
+    assert_eq!(parsed["ok"], false);
+    assert_eq!(parsed["error"]["code"], "SF0003");
+    assert!(parsed["error"]["message"].is_string());
+    assert!(parsed["error"]["cause"].is_string());
+    assert!(parsed["error"]["fix"].is_string());
+    assert!(parsed["error"]["docs"].is_string());
+    assert_eq!(parsed["error"]["exit_code"], 3);
+    assert_eq!(output.status.code(), Some(3));
+}
+
+#[test]
+fn explain_error_prints_cause_fix_and_docs_link() {
+    let home = isolated_home();
+    let output = starforge(home.path())
+        .args(["--quiet", "explain-error", "SF1203"])
+        .output()
+        .expect("spawn explain-error");
+    assert_success(&output, "starforge explain-error SF1203");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Code: SF1203"));
+    assert!(stdout.contains("Cause: The deployment transaction"));
+    assert!(stdout.contains("Fix: Review the transaction"));
+    assert!(stdout.contains("ERRORS.md#sf1203"));
+}
+
+#[test]
 fn wallet_list_exits_zero() {
     let home = isolated_home();
     let output = starforge(home.path())
@@ -85,6 +232,49 @@ fn template_list_exits_zero() {
         .output()
         .expect("spawn template list");
     assert_success(&output, "starforge template list");
+}
+
+#[test]
+fn template_validate_accepts_the_bundled_registry() {
+    let home = isolated_home();
+    let output = starforge(home.path())
+        .args(["template", "validate", "templates/registry.json"])
+        .output()
+        .expect("spawn template validate");
+    assert_success(&output, "starforge template validate");
+}
+
+#[test]
+fn template_validate_reports_the_offending_field() {
+    let home = isolated_home();
+    let bad = home.path().join("bad-registry.json");
+    std::fs::write(
+        &bad,
+        r#"{"templates":[{"name":"broken","version":"v1","description":"d",
+            "author":"a","tags":[],"source":{"type":"builtin","id":"broken"}}]}"#,
+    )
+    .expect("write bad registry");
+
+    let output = starforge(home.path())
+        .args(["template", "validate"])
+        .arg(&bad)
+        .output()
+        .expect("spawn template validate");
+
+    assert!(
+        !output.status.success(),
+        "an invalid registry should exit non-zero"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("templates[0].version"),
+        "output should name the offending field, got: {}",
+        combined
+    );
 }
 
 #[test]
@@ -355,42 +545,112 @@ fn config_subcommand_sets_and_shows_telemetry() {
 }
 
 #[test]
+fn telemetry_defaults_to_disabled() {
+    let home = isolated_home();
+
+    let output = starforge(home.path())
+        .args(["telemetry", "status"])
+        .output()
+        .expect("spawn telemetry status");
+    assert_success(&output, "starforge telemetry status");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("false"));
+}
+
+#[test]
 fn telemetry_subcommand_toggles_status() {
     let home = isolated_home();
 
-    // Disable telemetry
-    let output2 = starforge(home.path())
-        .args(["telemetry", "disable"])
-        .output()
-        .expect("spawn telemetry disable");
-    assert_success(&output2, "starforge telemetry disable");
-    let stdout2 = String::from_utf8_lossy(&output2.stdout);
-    assert!(stdout2.contains("disabled"));
-
-    // Check disabled status
-    let output3 = starforge(home.path())
-        .args(["telemetry", "status"])
-        .output()
-        .expect("spawn telemetry status");
-    assert_success(&output3, "starforge telemetry status");
-    let stdout3 = String::from_utf8_lossy(&output3.stdout);
-    assert!(stdout3.contains("false"));
-
-    // Enable telemetry
-    let output4 = starforge(home.path())
+    // Enable telemetry first from the default-off state
+    let output1 = starforge(home.path())
         .args(["telemetry", "enable"])
         .output()
         .expect("spawn telemetry enable");
-    assert_success(&output4, "starforge telemetry enable");
+    assert_success(&output1, "starforge telemetry enable");
 
     // Check enabled status
-    let output5 = starforge(home.path())
+    let output2 = starforge(home.path())
         .args(["telemetry", "status"])
         .output()
         .expect("spawn telemetry status");
-    assert_success(&output5, "starforge telemetry status");
-    let stdout5 = String::from_utf8_lossy(&output5.stdout);
-    assert!(stdout5.contains("true"));
+    assert_success(&output2, "starforge telemetry status");
+    let stdout2 = String::from_utf8_lossy(&output2.stdout);
+    assert!(stdout2.contains("true"));
+
+    // Disable telemetry
+    let output3 = starforge(home.path())
+        .args(["telemetry", "disable"])
+        .output()
+        .expect("spawn telemetry disable");
+    assert_success(&output3, "starforge telemetry disable");
+    let stdout3 = String::from_utf8_lossy(&output3.stdout);
+    assert!(stdout3.contains("disabled"));
+
+    // Check disabled status
+    let output4 = starforge(home.path())
+        .args(["telemetry", "status"])
+        .output()
+        .expect("spawn telemetry status");
+    assert_success(&output4, "starforge telemetry status");
+    let stdout4 = String::from_utf8_lossy(&output4.stdout);
+    assert!(stdout4.contains("false"));
+}
+
+#[test]
+fn telemetry_payload_and_reset_work() {
+    let home = isolated_home();
+
+    let enable = starforge(home.path())
+        .args(["telemetry", "enable"])
+        .output()
+        .expect("spawn telemetry enable");
+    assert_success(&enable, "starforge telemetry enable");
+
+    let mut cmd = starforge(home.path());
+    cmd.args(["deploy"]);
+    cmd.env("STARFORGE_TELEMETRY", "1");
+    let output = cmd.output().expect("spawn deploy");
+    let _ = output;
+
+    let payload = starforge(home.path())
+        .args(["telemetry", "payload"])
+        .output()
+        .expect("spawn telemetry payload");
+    assert_success(&payload, "starforge telemetry payload");
+    let stdout = String::from_utf8_lossy(&payload.stdout);
+    assert!(stdout.contains("\"event\""));
+
+    let reset = starforge(home.path())
+        .args(["telemetry", "reset"])
+        .output()
+        .expect("spawn telemetry reset");
+    assert_success(&reset, "starforge telemetry reset");
+    let payload_after = starforge(home.path())
+        .args(["telemetry", "payload"])
+        .output()
+        .expect("spawn telemetry payload");
+    assert_success(&payload_after, "starforge telemetry payload after reset");
+    let stdout_after = String::from_utf8_lossy(&payload_after.stdout);
+    assert!(stdout_after.contains("No telemetry payloads recorded yet."));
+}
+
+#[test]
+fn telemetry_invalid_bool_value_fails_cleanly() {
+    let home = isolated_home();
+
+    let output = starforge(home.path())
+        .args(["config", "set", "telemetry.enabled", "maybe"])
+        .output()
+        .expect("spawn config set invalid telemetry");
+
+    assert!(!output.status.success(), "invalid bool should fail");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("Expected boolean value") || combined.contains("Invalid"));
 }
 
 #[test]
@@ -415,6 +675,96 @@ fn write_config(home: &std::path::Path, contents: &str) {
     std::fs::write(dir.join("config.toml"), contents).expect("write config");
 }
 
+fn write_mock_network_config(home: &std::path::Path, horizon_url: &str, rpc_url: &str) {
+    write_config(
+        home,
+        &format!(
+            r#"
+version = "1"
+network = "testnet"
+telemetry_enabled = false
+wallets = []
+
+[networks.testnet]
+horizon_url = "{horizon_url}"
+soroban_rpc_url = "{rpc_url}"
+passphrase = "Test SDF Network ; September 2015"
+"#
+        ),
+    );
+}
+
+fn write_mock_deploy_config(home: &std::path::Path, rpc_url: &str) {
+    write_config(
+        home,
+        &format!(
+            r#"
+version = "1"
+network = "testnet"
+telemetry_enabled = false
+
+[networks.testnet]
+horizon_url = "http://127.0.0.1:1"
+soroban_rpc_url = "{rpc_url}"
+passphrase = "Test SDF Network ; September 2015"
+
+[[wallets]]
+name = "deployer"
+public_key = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+network = "testnet"
+created_at = "2026-01-01T00:00:00Z"
+funded = false
+"#
+        ),
+    );
+}
+
+fn constructor_wasm() -> Vec<u8> {
+    let mut wasm = vec![0, 0x61, 0x73, 0x6d, 1, 0, 0, 0];
+    wasm.extend_from_slice(&[1, 4, 1, 0x60, 0, 0]);
+    wasm.extend_from_slice(&[3, 2, 1, 0]);
+
+    let constructor = b"__constructor";
+    let mut exports = vec![1, constructor.len() as u8];
+    exports.extend_from_slice(constructor);
+    exports.extend_from_slice(&[0, 0]);
+    wasm.extend_from_slice(&[7, exports.len() as u8]);
+    wasm.extend_from_slice(&exports);
+    wasm.extend_from_slice(&[10, 4, 1, 2, 0, 0x0b]);
+    wasm
+}
+
+fn mock_horizon(server: &mut mockito::Server) -> mockito::Mock {
+    server
+        .mock("GET", "/")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"history_latest_ledger":123,"protocol_version":21,"horizon_version":"test"}"#,
+        )
+        .create()
+}
+
+fn mock_rpc_method(server: &mut mockito::Server, method: &str, result: &str) -> mockito::Mock {
+    let params = if method == "getLatestLedger" {
+        serde_json::json!([])
+    } else {
+        serde_json::json!({})
+    };
+    server
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(result)
+        .create()
+}
+
 #[test]
 fn config_doctor_smoke_in_isolated_home() {
     let home = isolated_home();
@@ -430,6 +780,260 @@ fn config_doctor_smoke_in_isolated_home() {
         stdout.contains("no config.toml found") || stdout.contains("config version is"),
         "expected default schema finding, got: {stdout}"
     );
+}
+
+#[test]
+fn config_doctor_reports_detected_protocol_version() {
+    let home = isolated_home();
+    let mut horizon = mockito::Server::new();
+    let mut rpc = mockito::Server::new();
+    let horizon_mock = mock_horizon(&mut horizon);
+    let health_mock = mock_rpc_method(
+        &mut rpc,
+        "getHealth",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}"#,
+    );
+    let version_mock = mock_rpc_method(
+        &mut rpc,
+        "getNetwork",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":22}}"#,
+    );
+    write_mock_network_config(home.path(), &horizon.url(), &rpc.url());
+
+    let output = starforge(home.path())
+        .args(["config", "doctor"])
+        .output()
+        .expect("spawn config doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Soroban protocol version 22"), "{stdout}");
+    assert!(
+        stdout.contains("soroban"),
+        "existing RPC health finding should remain: {stdout}"
+    );
+
+    horizon_mock.assert();
+    health_mock.assert();
+    version_mock.assert();
+}
+
+#[test]
+fn config_doctor_reports_protocol_failure_without_hiding_rpc_health() {
+    let home = isolated_home();
+    let mut horizon = mockito::Server::new();
+    let mut rpc = mockito::Server::new();
+    let horizon_mock = mock_horizon(&mut horizon);
+    let health_mock = mock_rpc_method(
+        &mut rpc,
+        "getHealth",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}"#,
+    );
+    let version_mock = mock_rpc_method(
+        &mut rpc,
+        "getNetwork",
+        r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}"#,
+    );
+    write_mock_network_config(home.path(), &horizon.url(), &rpc.url());
+
+    let output = starforge(home.path())
+        .args(["config", "doctor"])
+        .output()
+        .expect("spawn config doctor");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Soroban RPC reachable for 'testnet'"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("protocol version detection failed") && stdout.contains("Method not found"),
+        "{stdout}"
+    );
+
+    horizon_mock.assert();
+    health_mock.assert();
+    version_mock.assert();
+}
+
+#[test]
+fn network_test_reports_soroban_protocol_version_in_human_output() {
+    let home = isolated_home();
+    let mut horizon = mockito::Server::new();
+    let mut rpc = mockito::Server::new();
+    let horizon_mock = mock_horizon(&mut horizon);
+    let latest_mock = mock_rpc_method(
+        &mut rpc,
+        "getLatestLedger",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"latestLedger":123}}"#,
+    );
+    let version_mock = mock_rpc_method(
+        &mut rpc,
+        "getNetwork",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":22}}"#,
+    );
+    write_mock_network_config(home.path(), &horizon.url(), &rpc.url());
+
+    let output = starforge(home.path())
+        .args(["network", "test"])
+        .output()
+        .expect("spawn network test");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(stdout.contains("Soroban protocol version"), "{stdout}");
+    assert!(stdout.contains("22"), "{stdout}");
+
+    horizon_mock.assert();
+    latest_mock.assert();
+    version_mock.assert();
+}
+
+#[test]
+fn network_test_json_keeps_horizon_and_soroban_protocol_versions_distinct() {
+    let home = isolated_home();
+    let mut horizon = mockito::Server::new();
+    let mut rpc = mockito::Server::new();
+    let horizon_mock = mock_horizon(&mut horizon);
+    let latest_mock = mock_rpc_method(
+        &mut rpc,
+        "getLatestLedger",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"latestLedger":123}}"#,
+    );
+    let version_mock = mock_rpc_method(
+        &mut rpc,
+        "getNetwork",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":22}}"#,
+    );
+    write_mock_network_config(home.path(), &horizon.url(), &rpc.url());
+
+    let output = starforge(home.path())
+        .args(["--json", "network", "test"])
+        .output()
+        .expect("spawn network test --json");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON output");
+    assert_eq!(parsed["data"]["horizon"]["protocol_version"], 21);
+    assert_eq!(parsed["data"]["soroban_protocol_version"], 22);
+
+    horizon_mock.assert();
+    latest_mock.assert();
+    version_mock.assert();
+}
+
+#[cfg(unix)]
+#[test]
+fn constructor_deploy_with_protocol_21_fails_before_stellar_cli() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = isolated_home();
+    let mut rpc = mockito::Server::new();
+    let version_mock = mock_rpc_method(
+        &mut rpc,
+        "getNetwork",
+        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":21}}"#,
+    );
+    write_mock_deploy_config(home.path(), &rpc.url());
+
+    let wasm_path = home.path().join("constructor.wasm");
+    std::fs::write(&wasm_path, constructor_wasm()).expect("write constructor WASM");
+    let bin_dir = home.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("create fake binary directory");
+    let stellar_path = bin_dir.join("stellar");
+    std::fs::write(
+        &stellar_path,
+        "#!/bin/sh\nprintf called > \"$STARFORGE_TEST_STELLAR_CALLED\"\nexit 0\n",
+    )
+    .expect("write fake Stellar CLI");
+    let mut permissions = std::fs::metadata(&stellar_path)
+        .expect("read fake Stellar CLI metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&stellar_path, permissions).expect("make fake Stellar CLI executable");
+    let called_path = home.path().join("stellar-called");
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let output = starforge(home.path())
+        .args([
+            "deploy",
+            "--wasm",
+            wasm_path.to_str().expect("WASM path is UTF-8"),
+            "--wallet",
+            "deployer",
+            "--execute",
+            "--yes",
+        ])
+        .env("PATH", path)
+        .env("STARFORGE_TEST_STELLAR_CALLED", &called_path)
+        .output()
+        .expect("spawn constructor deploy");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{combined}");
+    assert!(combined.contains("detected protocol 21"), "{combined}");
+    assert!(combined.contains("protocol 22"), "{combined}");
+    assert!(combined.contains("constructor"), "{combined}");
+    assert!(
+        !called_path.exists(),
+        "Stellar CLI ran despite the protocol gate"
+    );
+    version_mock.assert();
+}
+
+#[test]
+fn non_constructor_deploy_does_not_request_protocol_version() {
+    let home = isolated_home();
+    let mut rpc = mockito::Server::new();
+    let version_mock = rpc
+        .mock("POST", "/")
+        .match_body(mockito::Matcher::Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getNetwork",
+            "params": {}
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":22}}"#)
+        .expect(0)
+        .create();
+    write_mock_deploy_config(home.path(), &rpc.url());
+
+    let wasm_path = home.path().join("without-constructor.wasm");
+    std::fs::write(&wasm_path, [0, 0x61, 0x73, 0x6d, 1, 0, 0, 0])
+        .expect("write non-constructor WASM");
+    let output = starforge(home.path())
+        .args([
+            "deploy",
+            "--wasm",
+            wasm_path.to_str().expect("WASM path is UTF-8"),
+            "--wallet",
+            "deployer",
+            "--execute",
+            "--yes",
+        ])
+        .output()
+        .expect("spawn non-constructor deploy");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!output.status.success(), "{combined}");
+    assert!(combined.contains("no local secret key"), "{combined}");
+    version_mock.assert();
 }
 
 #[test]
@@ -531,7 +1135,13 @@ fn multisig_create_and_sign_workflow() {
     let created_path = entries[0].path();
 
     let sign_alice = starforge(home.path())
-        .args(["multisig", "sign", created_path.to_str().unwrap(), "alice"])
+        .args([
+            "multisig",
+            "sign",
+            "--wallet",
+            "alice",
+            created_path.to_str().unwrap(),
+        ])
         .output()
         .expect("spawn multisig sign alice");
     assert_success(&sign_alice, "starforge multisig sign alice");
@@ -546,7 +1156,13 @@ fn multisig_create_and_sign_workflow() {
     assert!(status_out.contains("50%"));
 
     let sign_bob = starforge(home.path())
-        .args(["multisig", "sign", created_path.to_str().unwrap(), "bob"])
+        .args([
+            "multisig",
+            "sign",
+            "--wallet",
+            "bob",
+            created_path.to_str().unwrap(),
+        ])
         .output()
         .expect("spawn multisig sign bob");
     assert_success(&sign_bob, "starforge multisig sign bob");
@@ -563,8 +1179,9 @@ fn multisig_create_and_sign_workflow() {
         .args([
             "multisig",
             "export",
-            created_path.to_str().unwrap(),
+            "--output",
             export_path.to_str().unwrap(),
+            created_path.to_str().unwrap(),
         ])
         .output()
         .expect("spawn multisig export");
@@ -575,8 +1192,9 @@ fn multisig_create_and_sign_workflow() {
         .args([
             "multisig",
             "import",
-            export_path.to_str().unwrap(),
+            "--output",
             import_path.to_str().unwrap(),
+            export_path.to_str().unwrap(),
         ])
         .output()
         .expect("spawn multisig import");
@@ -618,8 +1236,9 @@ fn multisig_from_template_creates_proposal() {
         .args([
             "multisig",
             "from-template",
-            "escrow",
+            "--output",
             output_path.to_str().unwrap(),
+            "escrow",
         ])
         .output()
         .expect("spawn multisig from-template");
@@ -629,4 +1248,156 @@ fn multisig_from_template_creates_proposal() {
     let contents = std::fs::read_to_string(&output_path).expect("read escrow proposal");
     assert!(contents.contains("buyer"));
     assert!(contents.contains("\"threshold\": 2"));
+}
+
+fn onboarding_command(
+    home: &std::path::Path,
+    working_dir: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    starforge(home)
+        .current_dir(working_dir)
+        .args(args)
+        .output()
+        .expect("spawn onboarding command")
+}
+
+#[test]
+fn onboarding_completes_offline_and_failed_checkpoints_do_not_advance() {
+    let home = isolated_home();
+    let working_dir = isolated_home();
+
+    let start = onboarding_command(
+        home.path(),
+        working_dir.path(),
+        &[
+            "tool",
+            "tutorial",
+            "start",
+            "onboarding-15-minute",
+            "--demo",
+        ],
+    );
+    assert_success(
+        &start,
+        "starforge tool tutorial start onboarding-15-minute --demo",
+    );
+
+    let installed = onboarding_command(home.path(), working_dir.path(), &["--version"]);
+    assert_success(&installed, "starforge --version");
+    let first_next = onboarding_command(
+        home.path(),
+        working_dir.path(),
+        &["tool", "tutorial", "next"],
+    );
+    assert_success(
+        &first_next,
+        "starforge tool tutorial next (install checkpoint)",
+    );
+
+    let missing_wallet = onboarding_command(
+        home.path(),
+        working_dir.path(),
+        &["tool", "tutorial", "next"],
+    );
+    assert!(!missing_wallet.status.success());
+    let missing_wallet_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&missing_wallet.stdout),
+        String::from_utf8_lossy(&missing_wallet.stderr)
+    );
+    assert!(missing_wallet_output.contains("Repair hint:"));
+    assert!(missing_wallet_output.contains("starforge wallet create onboarding"));
+
+    let status = onboarding_command(
+        home.path(),
+        working_dir.path(),
+        &["tool", "tutorial", "status"],
+    );
+    assert_success(&status, "starforge tool tutorial status");
+    assert!(String::from_utf8_lossy(&status.stdout).contains("step 2 of 4 (1 completed)"));
+
+    let wallet = onboarding_command(
+        home.path(),
+        working_dir.path(),
+        &["wallet", "create", "onboarding"],
+    );
+    assert_success(&wallet, "starforge wallet create onboarding");
+    let wallet_next = onboarding_command(
+        home.path(),
+        working_dir.path(),
+        &["tool", "tutorial", "next"],
+    );
+    assert_success(
+        &wallet_next,
+        "starforge tool tutorial next (wallet checkpoint)",
+    );
+
+    let missing_project = onboarding_command(
+        home.path(),
+        working_dir.path(),
+        &["tool", "tutorial", "next"],
+    );
+    assert!(!missing_project.status.success());
+    let missing_project_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&missing_project.stdout),
+        String::from_utf8_lossy(&missing_project.stderr)
+    );
+    assert!(missing_project_output.contains("Repair hint:"));
+    assert!(missing_project_output.contains("onboarding-contract"));
+
+    let scaffold = onboarding_command(
+        home.path(),
+        working_dir.path(),
+        &[
+            "new",
+            "contract",
+            "onboarding-contract",
+            "--template",
+            "hello-world",
+        ],
+    );
+    assert_success(
+        &scaffold,
+        "starforge new contract onboarding-contract --template hello-world",
+    );
+    let scaffold_next = onboarding_command(
+        home.path(),
+        working_dir.path(),
+        &["tool", "tutorial", "next"],
+    );
+    assert_success(
+        &scaffold_next,
+        "starforge tool tutorial next (scaffold checkpoint)",
+    );
+
+    let simulation = onboarding_command(
+        home.path(),
+        working_dir.path(),
+        &["network", "simulate", "run", "--scenario", "simple-counter"],
+    );
+    assert_success(
+        &simulation,
+        "starforge network simulate run --scenario simple-counter",
+    );
+    let completed = onboarding_command(
+        home.path(),
+        working_dir.path(),
+        &["tool", "tutorial", "next"],
+    );
+    assert_success(
+        &completed,
+        "starforge tool tutorial next (simulation checkpoint)",
+    );
+    let completed_output = String::from_utf8_lossy(&completed.stdout);
+    assert!(completed_output.contains("Tutorial complete!"));
+    assert!(completed_output.contains("Elapsed"));
+
+    let progress_path = home.path().join(".starforge/tutorial_status.json");
+    let progress: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(progress_path).expect("read local progress"))
+            .expect("parse local progress");
+    assert_eq!(progress["active"], serde_json::Value::Null);
+    assert_eq!(progress["completed_steps"], serde_json::json!([0, 1, 2, 3]));
 }

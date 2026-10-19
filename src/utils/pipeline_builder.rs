@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::utils::config;
+use crate::utils::progress::ProgressReporter;
 use crate::utils::test_runner::{run_contract_tests, TestOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -336,10 +337,12 @@ pub fn execute_pipeline(
     let mut failed = 0u32;
     let mut rolled_back = Vec::new();
     let mut deploy_stage_ids = Vec::new();
+    let reporter = ProgressReporter::new(pipeline.stages.len());
 
     for index in 0..pipeline.stages.len() {
         let result = {
             let stage = &mut pipeline.stages[index];
+            reporter.started(index + 1, stage.name.clone());
             stage.status = StageStatus::Running;
             stage.error = None;
 
@@ -360,6 +363,7 @@ pub fn execute_pipeline(
 
         match result {
             Ok(msg) => {
+                reporter.completed(index + 1, pipeline.stages[index].name.clone(), msg.clone());
                 let waiting_approval = {
                     let stage = &mut pipeline.stages[index];
                     if stage.status == StageStatus::WaitingApproval {
@@ -387,6 +391,11 @@ pub fn execute_pipeline(
                 completed += 1;
             }
             Err(e) => {
+                reporter.failed(
+                    index + 1,
+                    pipeline.stages[index].name.clone(),
+                    e.to_string(),
+                );
                 let rollback_on_failure = {
                     let stage = &mut pipeline.stages[index];
                     stage.status = StageStatus::Failed;
@@ -927,19 +936,17 @@ pub fn import_pipeline(path: &Path) -> Result<DeploymentPipeline> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::TempDir;
 
     fn temp_home() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
         let guard = crate::utils::lock_home_env();
         let home = TempDir::new().unwrap();
-        std::env::set_var("HOME", home.path());
         (home, guard)
     }
 
     fn write_minimal_wasm(path: &Path) {
         let mut bytes = b"\0asm\x01\0\0\0".to_vec();
-        bytes.extend(std::iter::repeat_n(0u8, 64));
+        bytes.extend(vec![0u8; 64]);
         std::fs::write(path, bytes).unwrap();
     }
 

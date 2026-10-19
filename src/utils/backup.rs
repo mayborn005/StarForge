@@ -158,7 +158,7 @@ pub fn load_backup(id: &str) -> Result<BackupRecord> {
 fn zip_sources(sources: &[PathBuf]) -> Result<Vec<u8>> {
     let buf = Cursor::new(Vec::new());
     let mut zip = ZipWriter::new(buf);
-    let options: FileOptions =
+    let options: FileOptions<()> =
         FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     for src in sources {
@@ -176,7 +176,7 @@ fn add_path_to_zip<W: Write + std::io::Seek>(
     zip: &mut ZipWriter<W>,
     base: &Path,
     path: &Path,
-    options: FileOptions,
+    options: FileOptions<()>,
 ) -> Result<()> {
     if path.is_dir() {
         for entry in fs::read_dir(path)? {
@@ -679,7 +679,7 @@ mod tests {
         let src_dir = tempdir().unwrap();
         let f1 = make_source_file(src_dir.path(), "a.wasm", "hello-wasm");
 
-        let bytes = zip_sources(&[f1.clone()]).unwrap();
+        let bytes = zip_sources(std::slice::from_ref(&f1)).unwrap();
         let out_dir = tempdir().unwrap();
         let extracted = extract_zip(&bytes, out_dir.path()).unwrap();
         assert_eq!(extracted.len(), 1);
@@ -691,7 +691,7 @@ mod tests {
     fn checksum_changes_when_contents_change() {
         let dir = tempdir().unwrap();
         let f1 = make_source_file(dir.path(), "a.txt", "v1");
-        let b1 = zip_sources(&[f1.clone()]).unwrap();
+        let b1 = zip_sources(std::slice::from_ref(&f1)).unwrap();
         let f2 = make_source_file(dir.path(), "a.txt", "v2");
         let b2 = zip_sources(&[f2]).unwrap();
         assert_ne!(

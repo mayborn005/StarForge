@@ -17,7 +17,7 @@ use std::process::Command;
 fn starforge(home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_starforge"));
     cmd.arg("-q");
-    cmd.env("HOME", home);
+    cmd.env("STARFORGE_HOME", home);
     cmd.env("USERPROFILE", home);
     cmd
 }
@@ -38,7 +38,7 @@ fn write_wasm(dir: &Path) -> std::path::PathBuf {
         bytes.extend_from_slice(name.as_bytes());
         bytes.push(0);
     }
-    bytes.extend(std::iter::repeat_n(0u8, 4096));
+    bytes.extend(vec![0u8; 4096]);
 
     let path = dir.join("contract.wasm");
     std::fs::write(&path, bytes).expect("write wasm fixture");
