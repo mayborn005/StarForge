@@ -18,11 +18,12 @@ pub struct EventStreamFilters {
 }
 
 /// Transport used for Soroban event streaming.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EventStreamTransport {
     /// Prefer a persistent WebSocket JSON-RPC connection, then fall back to HTTP polling.
     Auto,
     /// Use JSON-RPC over HTTP polling.
+    #[default]
     Http,
     /// Use JSON-RPC over a persistent WebSocket connection.
     WebSocket,
@@ -39,12 +40,6 @@ impl EventStreamTransport {
                 other
             ),
         }
-    }
-}
-
-impl Default for EventStreamTransport {
-    fn default() -> Self {
-        Self::Http
     }
 }
 
@@ -112,6 +107,17 @@ impl SorobanEventStream {
     pub fn with_poll_interval(mut self, seconds: u64) -> Self {
         self.poll_interval = Duration::from_secs(seconds.max(1));
         self
+    }
+
+    /// Resume pagination from an opaque Soroban RPC cursor.
+    pub fn with_cursor(mut self, cursor: Option<String>) -> Self {
+        self.cursor = cursor;
+        self
+    }
+
+    /// Return the latest RPC pagination cursor received from the server.
+    pub fn cursor(&self) -> Option<&str> {
+        self.cursor.as_deref()
     }
 
     pub fn with_filters(mut self, filters: EventStreamFilters) -> Self {
@@ -274,9 +280,7 @@ impl SorobanEventStream {
                 .websocket
                 .as_mut()
                 .ok_or_else(|| anyhow::anyhow!("WebSocket connection is not available"))?;
-            websocket
-                .send(Message::Text(request.to_string().into()))
-                .await
+            websocket.send(Message::Text(request.to_string())).await
         };
 
         if let Err(err) = send_result {
@@ -563,8 +567,7 @@ mod tests {
                             }]
                         }
                     })
-                    .to_string()
-                    .into(),
+                    .to_string(),
                 ))
                 .await
                 .unwrap();

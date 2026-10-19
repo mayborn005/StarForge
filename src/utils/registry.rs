@@ -2,7 +2,6 @@ use crate::utils::http_client;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::PathBuf;
 
 /// Configuration for the remote template registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +34,8 @@ impl Default for RegistryConfig {
 #[derive(Debug, Serialize)]
 pub struct PublishTemplateRequest {
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub org: Option<String>,
     pub version: String,
     pub description: String,
     pub author: String,
@@ -125,6 +126,8 @@ pub struct RemoteTemplateEntry {
     pub updated_at: String,
     pub ratings: TemplateRatings,
     pub download_url: String,
+    #[serde(default)]
+    pub expected_sha256: Option<String>,
 }
 
 /// Rating and review statistics for a template.
@@ -249,6 +252,47 @@ impl RegistryClient {
         Ok(result)
     }
 
+    pub async fn create_organization(&self, slug: &str, name: &str) -> Result<()> {
+        let url = format!("{}/api/orgs", self.registry_url);
+        let body = serde_json::json!({ "slug": slug, "name": name });
+        let mut req = http_client::get_client().post(&url).json(&body);
+        for (key, value) in self.build_headers() {
+            req = req.header(&key, &value);
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "Organization creation failed with status {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
+    pub async fn add_organization_member(
+        &self,
+        slug: &str,
+        username: &str,
+        role: &str,
+    ) -> Result<()> {
+        let url = format!("{}/api/orgs/{}/members", self.registry_url, slug);
+        let body = serde_json::json!({ "username": username, "role": role });
+        let mut req = http_client::get_client().post(&url).json(&body);
+        for (key, value) in self.build_headers() {
+            req = req.header(&key, &value);
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!(
+                "Adding organization member failed with status {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            );
+        }
+        Ok(())
+    }
+
     /// Authenticate with the remote registry.
     pub async fn authenticate(&self, email: &str, password: &str) -> Result<AuthResponse> {
         let url = format!("{}/api/auth/login", self.registry_url);
@@ -306,7 +350,11 @@ impl RegistryClient {
     }
 
     /// Download a template archive from the remote registry.
-    pub async fn download_template(&self, download_url: &str) -> Result<Vec<u8>> {
+    pub async fn download_template(
+        &self,
+        download_url: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<Vec<u8>> {
         let resp = http_client::get_client()
             .get(download_url)
             .send()
@@ -322,6 +370,9 @@ impl RegistryClient {
         }
 
         let bytes = resp.bytes().await?;
+        if let Some(expected_hex) = expected_sha256 {
+            crate::utils::templates::verify_archive_checksum(&bytes, expected_hex)?;
+        }
         Ok(bytes.to_vec())
     }
 
@@ -360,8 +411,7 @@ impl RegistryClient {
 
 /// Load registry configuration from ~/.starforge/registry.toml
 pub fn load_registry_config() -> Result<RegistryConfig> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let config_path = home.join(".starforge").join("registry.toml");
+    let config_path = crate::utils::config::config_dir().join("registry.toml");
 
     if config_path.exists() {
         let contents = fs::read_to_string(&config_path)?;
@@ -378,8 +428,7 @@ pub fn load_registry_config() -> Result<RegistryConfig> {
 
 /// Save registry configuration to ~/.starforge/registry.toml
 pub fn save_registry_config(config: &RegistryConfig) -> Result<()> {
-    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
-    let dir = home.join(".starforge");
+    let dir = crate::utils::config::config_dir();
     let config_path = dir.join("registry.toml");
 
     if !dir.exists() {

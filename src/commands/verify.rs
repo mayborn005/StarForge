@@ -29,6 +29,8 @@ pub enum VerifyCommands {
     Ci(CiArgs),
     /// Visualize verification results as an ASCII chart
     Visualize(VisualizeArgs),
+    /// Verify Cargo.lock reproducibility across supported platforms
+    Lockfile(LockfileArgs),
 }
 
 #[derive(Subcommand)]
@@ -127,14 +129,24 @@ pub struct CiArgs {
     #[arg(long, default_value = "github", value_parser = ["github", "gitlab", "circleci"])]
     pub platform: String,
     /// WASM path to embed in the snippet
-    #[arg(
-        long,
-        default_value = "target/wasm32-unknown-unknown/release/contract.wasm"
-    )]
-    pub wasm: String,
+    #[arg(long)]
+    pub wasm: Option<String>,
     /// Contract label to embed in the snippet
     #[arg(long, default_value = "my-contract")]
     pub contract: String,
+}
+
+#[derive(Args)]
+pub struct LockfileArgs {
+    /// Target project directory containing Cargo.toml and Cargo.lock (defaults to current directory)
+    #[arg(long, short)]
+    pub path: Option<PathBuf>,
+    /// Output results in JSON format
+    #[arg(long)]
+    pub json: bool,
+    /// Treat non-critical warnings as failure violations
+    #[arg(long)]
+    pub strict: bool,
 }
 
 // ── Data structures ───────────────────────────────────────────────────────────
@@ -333,6 +345,8 @@ fn generate_harness_content(wasm_path: &Path, properties: &[PropertySpec]) -> St
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let wasm_target = crate::utils::wasm_target::resolve_target(None)
+        .unwrap_or_else(|_| "<selected-target>".to_string());
 
     format!(
         r#"//! Formal verification harness for: {wasm_name}
@@ -355,7 +369,7 @@ mod property_tests {{
     fn wasm_exists() {{
         assert!(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target/wasm32-unknown-unknown/release/{wasm_name}.wasm")
+                .join("target/{wasm_target}/release/{wasm_name}.wasm")
                 .exists()
                 || true, // path may differ; update accordingly
             "WASM artifact not found"
@@ -365,6 +379,7 @@ mod property_tests {{
 "#,
         wasm_name = wasm_name,
         prop_stubs = prop_stubs,
+        wasm_target = wasm_target,
     )
 }
 
@@ -382,6 +397,7 @@ pub async fn handle(cmd: VerifyCommands) -> Result<()> {
         VerifyCommands::Reports(args) => handle_reports(args),
         VerifyCommands::Ci(args) => handle_ci(args),
         VerifyCommands::Visualize(args) => handle_visualize(args),
+        VerifyCommands::Lockfile(args) => handle_lockfile(args),
     }
 }
 
@@ -518,7 +534,7 @@ fn handle_property_list(args: PropertyListArgs) -> Result<()> {
     let props = load_properties()?;
     let filtered: Vec<_> = props
         .iter()
-        .filter(|p| args.contract.as_deref().is_none_or(|c| p.contract == c))
+        .filter(|p| args.contract.as_deref().map_or(true, |c| p.contract == c))
         .collect();
 
     if filtered.is_empty() {
@@ -748,7 +764,7 @@ fn handle_reports(args: ReportsArgs) -> Result<()> {
     let reports = load_reports()?;
     let filtered: Vec<_> = reports
         .iter()
-        .filter(|r| args.contract.as_deref().is_none_or(|c| r.contract == c))
+        .filter(|r| args.contract.as_deref().map_or(true, |c| r.contract == c))
         .collect();
 
     if filtered.is_empty() {
@@ -790,6 +806,11 @@ fn handle_reports(args: ReportsArgs) -> Result<()> {
 
 fn handle_ci(args: CiArgs) -> Result<()> {
     p::header("CI Configuration for Continuous Verification");
+    let target = crate::utils::wasm_target::resolve_target(None)?;
+    let wasm = match args.wasm {
+        Some(wasm) => wasm,
+        None => format!("target/{target}/release/contract.wasm"),
+    };
 
     let snippet = match args.platform.as_str() {
         "github" => format!(
@@ -804,12 +825,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-      - name: Build contract WASM
-        run: cargo build --target wasm32-unknown-unknown --release
+            - uses: dtolnay/rust-toolchain@stable
+                with:
+                    targets: {target}
+            - name: Build contract WASM
+                run: cargo build --target {target} --release
       - name: Install starforge
         run: cargo install --path .
       - name: Add verification properties
@@ -829,8 +849,9 @@ jobs:
         if: always()
         run: starforge verify report --contract {contract}
 "#,
-            wasm = args.wasm,
-            contract = args.contract
+            wasm = wasm,
+            contract = args.contract,
+            target = target
         ),
         "gitlab" => format!(
             r#"# .gitlab-ci.yml (verification job)
@@ -838,16 +859,17 @@ verify-contract:
   image: rust:latest
   stage: test
   before_script:
-    - rustup target add wasm32-unknown-unknown
+    - rustup target add {target}
     - cargo install --path .
   script:
-    - cargo build --target wasm32-unknown-unknown --release
+    - cargo build --target {target} --release
     - starforge verify property add --contract {contract} --name no-overflow --spec no_overflow --severity critical
     - starforge verify run --wasm {wasm} --contract {contract} --fail-on-critical true
     - starforge verify report --contract {contract}
 "#,
-            wasm = args.wasm,
-            contract = args.contract
+            wasm = wasm,
+            contract = args.contract,
+            target = target
         ),
         "circleci" => format!(
             r#"# .circleci/config.yml (verification job)
@@ -861,8 +883,8 @@ jobs:
       - run:
           name: Build WASM
           command: |
-            rustup target add wasm32-unknown-unknown
-            cargo build --target wasm32-unknown-unknown --release
+            rustup target add {target}
+            cargo build --target {target} --release
       - run:
           name: Run formal verification
           command: |
@@ -870,11 +892,18 @@ jobs:
             starforge verify property add --contract {contract} --name no-overflow --spec no_overflow --severity critical
             starforge verify run --wasm {wasm} --contract {contract} --fail-on-critical true
 "#,
-            wasm = args.wasm,
-            contract = args.contract
+            wasm = wasm,
+            contract = args.contract,
+            target = target
         ),
         _ => unreachable!(),
     };
+    let snippet = snippet
+        .replace("            - uses: actions/checkout", "      - uses: actions/checkout")
+        .replace("                with:", "        with:")
+        .replace("                    targets:", "          targets:")
+        .replace("            - name: Build contract WASM", "      - name: Build contract WASM")
+        .replace("                run: cargo build", "        run: cargo build");
 
     p::separator();
     println!("{}", snippet.bright_white());
@@ -947,6 +976,69 @@ fn handle_visualize(args: VisualizeArgs) -> Result<()> {
         println!();
         p::success("All checked properties passed or are proven");
     }
+    Ok(())
+}
+
+fn handle_lockfile(args: LockfileArgs) -> Result<()> {
+    use crate::utils::cargo_lock::{
+        verify_cargo_lock_reproducibility, CargoLockVerificationConfig,
+    };
+
+    let project_dir = args.path.unwrap_or_else(|| PathBuf::from("."));
+    let config = CargoLockVerificationConfig {
+        project_dir,
+        strict: args.strict,
+    };
+
+    let result = verify_cargo_lock_reproducibility(&config)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        p::header("Cargo.lock Reproducibility Check");
+        p::kv("Project Path", &result.project_dir);
+        p::kv(
+            "Cargo.toml Manifest",
+            if result.has_manifest {
+                "Found"
+            } else {
+                "Missing"
+            },
+        );
+        p::kv(
+            "Cargo.lock File",
+            if result.has_lockfile {
+                "Found"
+            } else {
+                "Missing"
+            },
+        );
+
+        if result.is_ok() {
+            p::success("Cargo.lock is reproducible and unmutated under locked resolution.");
+        } else {
+            p::separator();
+            if let Some(err) = &result.resolution_error {
+                p::warn("Resolution Error:");
+                println!("{}", err);
+            }
+            if let Some(diff) = &result.diff_summary {
+                p::warn("Lockfile Mutation Diff:");
+                println!("{}", diff);
+            }
+            for v in &result.violations {
+                p::warn(&format!("Violation: {}", v));
+            }
+        }
+    }
+
+    if !result.is_ok() {
+        anyhow::bail!(
+            "Cargo.lock reproducibility verification failed with {} violation(s).",
+            result.violations.len()
+        );
+    }
+
     Ok(())
 }
 
