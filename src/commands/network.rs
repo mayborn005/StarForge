@@ -1,4 +1,8 @@
-use crate::utils::{config, http_client, output, print as p};
+use crate::utils::{
+    config,
+    dry_run::{self, DryRunPlan, PlannedOperation},
+    output, print as p, soroban,
+};
 use anyhow::Result;
 use clap::Subcommand;
 use std::time::Duration;
@@ -24,13 +28,13 @@ pub enum NetworkCommands {
         #[arg(long)]
         horizon_url: String,
         /// Optional Soroban RPC URL
-        #[arg(long)]
+        #[arg(long, hide = true)]
         soroban_rpc_url: Option<String>,
         /// Optional network faucet / Friendbot URL
-        #[arg(long)]
+        #[arg(long, hide = true)]
         friendbot_url: Option<String>,
         /// Optional network passphrase for transaction signing (defaults to testnet passphrase)
-        #[arg(long)]
+        #[arg(long, hide = true)]
         passphrase: Option<String>,
     },
     /// Test connectivity to a network
@@ -38,6 +42,9 @@ pub enum NetworkCommands {
         /// Network to test (defaults to current active network)
         #[arg(default_value = None)]
         network: Option<String>,
+        /// Emit machine-readable JSON output
+        #[arg(long)]
+        json: bool,
     },
     /// Remove a custom network from configuration
     Remove {
@@ -51,9 +58,27 @@ pub enum NetworkCommands {
         /// New network name
         new_name: String,
     },
+
+    // ── Commands moved under `network` by ADR 0007 ───────────────────────
+    // Each moved command keeps its own argument struct, so no flag definition
+    // is duplicated here; `handle` forwards to the owning module.
+    /// Local Soroban devnet (Docker quickstart)
+    #[command(subcommand)]
+    Node(crate::commands::node::NodeCommands),
+    /// Local network simulation and testing environment
+    #[command(subcommand)]
+    Simulate(crate::commands::simulate::SimulateCommands),
+    /// Create and manage deterministic live-ledger snapshots for local tests
+    #[command(subcommand)]
+    Snapshot(crate::commands::snapshot::SnapshotCommands),
 }
 
 pub async fn handle(cmd: NetworkCommands) -> Result<()> {
+    if dry_run::is_enabled() {
+        if let Some(plan) = dry_run_plan(&cmd) {
+            return plan.emit(output::is_json_mode_enabled());
+        }
+    }
     match cmd {
         NetworkCommands::Show { json } => show(json),
         NetworkCommands::Switch { network } => switch(network),
@@ -70,9 +95,88 @@ pub async fn handle(cmd: NetworkCommands) -> Result<()> {
             friendbot_url,
             passphrase,
         ),
-        NetworkCommands::Test { network } => test_network(network).await,
+        NetworkCommands::Test { network, json } => test_network(network, json).await,
         NetworkCommands::Remove { name } => remove_network(name),
         NetworkCommands::Rename { old_name, new_name } => rename_network(old_name, new_name),
+        // ADR 0007: forward the commands that moved under `network`.
+        NetworkCommands::Node(cmd) => crate::commands::node::handle(cmd).await,
+        NetworkCommands::Simulate(cmd) => crate::commands::simulate::handle(cmd).await,
+        NetworkCommands::Snapshot(cmd) => crate::commands::snapshot::handle(cmd).await,
+    }
+}
+
+/// Build the plan shown by `--dry-run` for a mutating `network` subcommand.
+///
+/// `show` and `test` are read-only and return `None`.
+fn dry_run_plan(cmd: &NetworkCommands) -> Option<DryRunPlan> {
+    match cmd {
+        NetworkCommands::Switch { network } => Some(
+            DryRunPlan::new(
+                "network switch",
+                format!("Switch the active network to '{network}'"),
+            )
+            .network(network.clone())
+            .operation(PlannedOperation::new(
+                "config.write",
+                "active network",
+                format!("would set the active network to '{network}'"),
+            ))
+            .writes_filesystem(),
+        ),
+        NetworkCommands::Add {
+            name,
+            horizon_url,
+            soroban_rpc_url,
+            friendbot_url,
+            ..
+        } => {
+            let mut operation = PlannedOperation::new(
+                "config.write",
+                name.clone(),
+                format!("would add custom network '{name}' to the configuration"),
+            )
+            .detail("Horizon", horizon_url.clone());
+            if let Some(url) = soroban_rpc_url {
+                operation = operation.detail("Soroban RPC", url.clone());
+            }
+            if let Some(url) = friendbot_url {
+                operation = operation.detail("Friendbot", url.clone());
+            }
+            Some(
+                DryRunPlan::new("network add", format!("Add custom network '{name}'"))
+                    .network(name.clone())
+                    .operation(operation)
+                    .writes_filesystem(),
+            )
+        }
+        NetworkCommands::Remove { name } => Some(
+            DryRunPlan::new("network remove", format!("Remove custom network '{name}'"))
+                .network(name.clone())
+                .operation(PlannedOperation::new(
+                    "config.write",
+                    name.clone(),
+                    format!("would remove custom network '{name}' from the configuration"),
+                ))
+                .writes_filesystem()
+                .warn("If this is the active network, StarForge will switch back to testnet"),
+        ),
+        NetworkCommands::Rename { old_name, new_name } => Some(
+            DryRunPlan::new(
+                "network rename",
+                format!("Rename custom network '{old_name}' to '{new_name}'"),
+            )
+            .network(new_name.clone())
+            .operation(PlannedOperation::new(
+                "config.write",
+                new_name.clone(),
+                format!("would rename custom network '{old_name}' to '{new_name}'"),
+            ))
+            .writes_filesystem(),
+        ),
+        NetworkCommands::Show { .. } | NetworkCommands::Test { .. } => None,
+        NetworkCommands::Node(_) | NetworkCommands::Simulate(_) | NetworkCommands::Snapshot(_) => {
+            None
+        }
     }
 }
 
@@ -87,6 +191,8 @@ fn show(json: bool) -> Result<()> {
             horizon_url: String,
             soroban_rpc_url: Option<String>,
             friendbot_url: Option<String>,
+            /// Extra root CAs trusted for this network (#902).
+            ca_bundle: Option<String>,
             active: bool,
         }
 
@@ -104,6 +210,7 @@ fn show(json: bool) -> Result<()> {
                 horizon_url: net_cfg.horizon_url.clone(),
                 soroban_rpc_url: net_cfg.soroban_rpc_url.clone(),
                 friendbot_url: net_cfg.friendbot_url.clone(),
+                ca_bundle: net_cfg.ca_bundle.clone(),
                 active: cfg.network == *name,
             })
             .collect();
@@ -127,6 +234,9 @@ fn show(json: bool) -> Result<()> {
         if let Some(friendbot_url) = &net_cfg.friendbot_url {
             p::kv("Friendbot", friendbot_url);
         }
+        if let Some(ca_bundle) = &net_cfg.ca_bundle {
+            p::kv("CA bundle", ca_bundle);
+        }
         println!();
     }
 
@@ -143,7 +253,7 @@ fn switch(target: String) -> Result<()> {
 
     // Check if already on the target network
     if cfg.network == target {
-        p::info(&format!("Already on {}. No changes made.", target));
+        p::info(&format!("Already on network '{}'", target));
         return Ok(());
     }
 
@@ -165,12 +275,31 @@ fn switch(target: String) -> Result<()> {
     Ok(())
 }
 
-fn validate_url(label: &str, url: &str) -> Result<()> {
-    if url.is_empty() {
+pub fn validate_url(label: &str, url: &str) -> Result<()> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
         anyhow::bail!("{} URL cannot be empty", label);
     }
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        anyhow::bail!("{} URL must start with http:// or https://", label);
+    let parsed = reqwest::Url::parse(trimmed)
+        .map_err(|e| anyhow::anyhow!("Invalid {} URL '{}': {}", label, url, e))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        anyhow::bail!(
+            "{} URL scheme must be http or https, got '{}'",
+            label,
+            parsed.scheme()
+        );
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("{} URL missing valid host", label);
+    }
+    Ok(())
+}
+
+pub fn validate_passphrase(passphrase: &Option<String>) -> Result<()> {
+    if let Some(ref p) = passphrase {
+        if p.trim().is_empty() {
+            anyhow::bail!("Network passphrase cannot be empty or only whitespace");
+        }
     }
     Ok(())
 }
@@ -194,10 +323,12 @@ fn add_network(
         validate_url("Friendbot", url)?;
     }
 
+    validate_passphrase(&passphrase)?;
+
     // Normalize trailing slashes so URL construction is consistent downstream
-    let horizon_url = horizon_url.trim_end_matches('/').to_string();
-    let soroban_rpc_url = soroban_rpc_url.map(|u| u.trim_end_matches('/').to_string());
-    let friendbot_url = friendbot_url.map(|u| u.trim_end_matches('/').to_string());
+    let horizon_url = horizon_url.trim().trim_end_matches('/').to_string();
+    let soroban_rpc_url = soroban_rpc_url.map(|u| u.trim().trim_end_matches('/').to_string());
+    let friendbot_url = friendbot_url.map(|u| u.trim().trim_end_matches('/').to_string());
 
     config::add_custom_network(
         &mut cfg,
@@ -220,38 +351,113 @@ fn add_network(
     Ok(())
 }
 
-async fn test_network(network_name: Option<String>) -> Result<()> {
+#[derive(serde::Serialize, Debug)]
+pub struct EndpointHealth {
+    pub url: String,
+    pub reachable: bool,
+    pub latency_ms: u64,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+#[derive(serde::Serialize, Debug)]
+pub struct HorizonHealthDetails {
+    pub url: String,
+    pub reachable: bool,
+    pub latency_ms: u64,
+    pub latest_ledger: Option<u64>,
+    pub protocol_version: Option<u32>,
+    pub horizon_version: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(serde::Serialize, Debug)]
+pub struct NetworkHealthReport {
+    pub network: String,
+    pub healthy: bool,
+    pub timestamp: String,
+    pub horizon: HorizonHealthDetails,
+    pub soroban_rpc: Option<EndpointHealth>,
+    pub soroban_protocol_version: Option<u32>,
+    pub soroban_protocol_version_error: Option<String>,
+    pub friendbot: Option<EndpointHealth>,
+}
+
+async fn test_network(network_name: Option<String>, json: bool) -> Result<()> {
     let cfg = config::load()?;
     let test_network = network_name.unwrap_or_else(|| cfg.network.clone());
-
     let net_cfg = config::get_network_config(&cfg, &test_network)?;
+    let emit_json = json || output::is_json_mode_enabled();
 
-    p::info(&format!("Testing connectivity to '{}'…", test_network));
-    p::info(&format!("Horizon: {}", net_cfg.horizon_url));
+    if !emit_json {
+        p::info(&format!("Testing connectivity to '{}'…", test_network));
+        p::info(&format!("Horizon: {}", net_cfg.horizon_url));
+    }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(10)
-        .build()?;
+    // #902: the shared factory applies the proxy, the custom CA bundle and the
+    // `starforge/<version>` user agent to this probe exactly as it does to the
+    // requests the rest of the CLI sends.
+    let client = crate::utils::http_client::client_with_timeout(Duration::from_secs(10));
 
-    // Test Horizon endpoint
-    let client = http_client::get_client();
-    match client
-        .get(&format!("{}/health", net_cfg.horizon_url))
+    // Test Horizon endpoint & parse details
+    let start_horizon = std::time::Instant::now();
+    let horizon_res = client
+        .get(net_cfg.horizon_url.trim_end_matches('/'))
         .send()
-        .await
-    {
-        Ok(_) => {
-            p::success("✓ Horizon endpoint is reachable");
+        .await;
+    let horizon_latency = start_horizon.elapsed().as_millis() as u64;
+
+    let mut horizon_reachable = false;
+    let mut latest_ledger = None;
+    let mut protocol_version = None;
+    let mut horizon_version = None;
+    let mut horizon_err = None;
+
+    match horizon_res {
+        Ok(res) if res.status().is_success() => {
+            horizon_reachable = true;
+            if let Ok(val) = res.json::<serde_json::Value>().await {
+                latest_ledger = val.get("history_latest_ledger").and_then(|v| v.as_u64());
+                protocol_version = val
+                    .get("protocol_version")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as u32);
+                horizon_version = val
+                    .get("horizon_version")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+            if !emit_json {
+                p::success(&format!(
+                    "✓ Horizon endpoint is reachable ({}ms, ledger: {})",
+                    horizon_latency,
+                    latest_ledger.unwrap_or(0)
+                ));
+            }
+        }
+        Ok(res) => {
+            let status = res.status();
+            horizon_err = Some(format!("HTTP {}", status));
+            if !emit_json {
+                p::warn(&format!("✗ Horizon endpoint returned HTTP {}", status));
+            }
         }
         Err(e) => {
-            p::warn(&format!("✗ Horizon endpoint failed: {}", e));
+            horizon_err = Some(e.to_string());
+            if !emit_json {
+                p::warn(&format!("✗ Horizon endpoint failed: {}", e));
+            }
         }
     }
 
     // Test Soroban RPC if available
-    if let Some(soroban_url) = &net_cfg.soroban_rpc_url {
-        p::info(&format!("Soroban RPC: {}", soroban_url));
+    let mut soroban_health = None;
+    let mut soroban_protocol_version = None;
+    let mut soroban_protocol_version_error = None;
+    if let Some(ref soroban_url) = net_cfg.soroban_rpc_url {
+        if !emit_json {
+            p::info(&format!("Soroban RPC: {}", soroban_url));
+        }
         let req = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -259,17 +465,118 @@ async fn test_network(network_name: Option<String>) -> Result<()> {
             "params": []
         });
 
-        match client.post(soroban_url).json(&req).send().await {
-            Ok(_) => {
-                p::success("✓ Soroban RPC endpoint is reachable");
+        let start_soroban = std::time::Instant::now();
+        let soroban_res = client.post(soroban_url).json(&req).send().await;
+        let soroban_latency = start_soroban.elapsed().as_millis() as u64;
+
+        match soroban_res {
+            Ok(res) if res.status().is_success() => {
+                if !emit_json {
+                    p::success(&format!(
+                        "✓ Soroban RPC endpoint is reachable ({}ms)",
+                        soroban_latency
+                    ));
+                }
+                soroban_health = Some(EndpointHealth {
+                    url: soroban_url.clone(),
+                    reachable: true,
+                    latency_ms: soroban_latency,
+                    status: "healthy".to_string(),
+                    error: None,
+                });
+            }
+            Ok(res) => {
+                let err_msg = format!("HTTP {}", res.status());
+                if !emit_json {
+                    p::warn(&format!("✗ Soroban RPC returned {}", err_msg));
+                }
+                soroban_health = Some(EndpointHealth {
+                    url: soroban_url.clone(),
+                    reachable: false,
+                    latency_ms: soroban_latency,
+                    status: "error".to_string(),
+                    error: Some(err_msg),
+                });
             }
             Err(e) => {
-                p::warn(&format!("✗ Soroban RPC endpoint failed: {}", e));
+                let err_msg = e.to_string();
+                if !emit_json {
+                    p::warn(&format!("✗ Soroban RPC failed: {}", err_msg));
+                }
+                soroban_health = Some(EndpointHealth {
+                    url: soroban_url.clone(),
+                    reachable: false,
+                    latency_ms: soroban_latency,
+                    status: "unreachable".to_string(),
+                    error: Some(err_msg),
+                });
+            }
+        }
+
+        match soroban::get_protocol_version_for_url(soroban_url).await {
+            Ok(version) => {
+                soroban_protocol_version = Some(version);
+                if !emit_json {
+                    p::kv("Soroban protocol version", &version.to_string());
+                }
+            }
+            Err(error) => {
+                let message = format!("Soroban protocol version unavailable: {error:#}");
+                if !emit_json {
+                    p::warn(&message);
+                }
+                soroban_protocol_version_error = Some(message);
             }
         }
     }
 
-    p::info("Network test complete");
+    // Test Friendbot if available
+    let mut friendbot_health = None;
+    if let Some(ref f_url) = net_cfg.friendbot_url {
+        let start_fb = std::time::Instant::now();
+        let fb_res = client.get(f_url).send().await;
+        let fb_latency = start_fb.elapsed().as_millis() as u64;
+
+        let reachable = fb_res.is_ok();
+        friendbot_health = Some(EndpointHealth {
+            url: f_url.clone(),
+            reachable,
+            latency_ms: fb_latency,
+            status: if reachable {
+                "healthy".to_string()
+            } else {
+                "unreachable".to_string()
+            },
+            error: None,
+        });
+    }
+
+    let overall_healthy = horizon_reachable;
+    let report = NetworkHealthReport {
+        network: test_network.clone(),
+        healthy: overall_healthy,
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        horizon: HorizonHealthDetails {
+            url: net_cfg.horizon_url.clone(),
+            reachable: horizon_reachable,
+            latency_ms: horizon_latency,
+            latest_ledger,
+            protocol_version,
+            horizon_version,
+            error: horizon_err,
+        },
+        soroban_rpc: soroban_health,
+        soroban_protocol_version,
+        soroban_protocol_version_error,
+        friendbot: friendbot_health,
+    };
+
+    if emit_json {
+        output::print_json(&report)?;
+    } else {
+        p::info("Network test complete");
+    }
+
     Ok(())
 }
 
@@ -298,4 +605,33 @@ fn rename_network(old_name: String, new_name: String) -> Result<()> {
         old_name, new_name
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_url_valid() {
+        assert!(validate_url("Horizon", "https://horizon.stellar.org").is_ok());
+        assert!(validate_url("Horizon", "http://localhost:8000").is_ok());
+    }
+
+    #[test]
+    fn test_validate_url_invalid() {
+        assert!(validate_url("Horizon", "").is_err());
+        assert!(validate_url("Horizon", "   ").is_err());
+        assert!(validate_url("Horizon", "ftp://stellar.org").is_err());
+        assert!(validate_url("Horizon", "not-a-valid-url").is_err());
+    }
+
+    #[test]
+    fn test_validate_passphrase() {
+        assert!(validate_passphrase(&None).is_ok());
+        assert!(
+            validate_passphrase(&Some("Test SDF Network ; September 2015".to_string())).is_ok()
+        );
+        assert!(validate_passphrase(&Some("".to_string())).is_err());
+        assert!(validate_passphrase(&Some("   ".to_string())).is_err());
+    }
 }

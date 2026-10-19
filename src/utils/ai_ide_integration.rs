@@ -442,11 +442,13 @@ pub fn handle_request(request: &IdeRequest) -> IdeResponse {
 
 /// Builds the integration files for `ide`.
 pub fn build_integration(ide: Ide) -> IdeIntegration {
+    let wasm_target = crate::utils::wasm_target::resolve_target(None)
+        .unwrap_or_else(|_| crate::utils::wasm_target::V1_WASM_TARGET.to_string());
     let files = match ide {
         Ide::VsCode => vec![
             GeneratedFile {
                 relative_path: ".vscode/tasks.json".to_string(),
-                contents: VSCODE_TASKS.to_string(),
+                contents: VSCODE_TASKS.replace("__WASM_TARGET__", &wasm_target),
                 purpose: "Build, test, audit, and profile tasks".to_string(),
             },
             GeneratedFile {
@@ -464,12 +466,12 @@ pub fn build_integration(ide: Ide) -> IdeIntegration {
             GeneratedFile {
                 relative_path: ".idea/runConfigurations/Starforge_Audit.xml".to_string(),
                 contents: INTELLIJ_AUDIT_RUN_CONFIG.to_string(),
-                purpose: "Run configuration for `starforge ai-audit`".to_string(),
+                purpose: "Run configuration for `starforge ai security-audit`".to_string(),
             },
             GeneratedFile {
                 relative_path: ".idea/runConfigurations/Starforge_Profile.xml".to_string(),
-                contents: INTELLIJ_PROFILE_RUN_CONFIG.to_string(),
-                purpose: "Run configuration for `starforge ai-profile run`".to_string(),
+                contents: INTELLIJ_PROFILE_RUN_CONFIG.replace("__WASM_TARGET__", &wasm_target),
+                purpose: "Run configuration for `starforge ai profiling run`".to_string(),
             },
         ],
         Ide::Neovim => vec![GeneratedFile {
@@ -479,7 +481,7 @@ pub fn build_integration(ide: Ide) -> IdeIntegration {
         }],
         Ide::Zed => vec![GeneratedFile {
             relative_path: ".zed/tasks.json".to_string(),
-            contents: ZED_TASKS.to_string(),
+            contents: ZED_TASKS.replace("__WASM_TARGET__", &wasm_target),
             purpose: "Zed task definitions for audit and profiling".to_string(),
         }],
     };
@@ -567,26 +569,26 @@ const VSCODE_TASKS: &str = r#"{
     {
       "label": "starforge: build contract",
       "type": "shell",
-      "command": "stellar contract build",
+    "command": "starforge contract build",
       "group": "build",
       "problemMatcher": ["$rustc"]
     },
     {
       "label": "starforge: AI audit",
       "type": "shell",
-      "command": "starforge ai-audit ${file}",
+      "command": "starforge ai security-audit ${file}",
       "problemMatcher": []
     },
     {
       "label": "starforge: AI profile",
       "type": "shell",
-      "command": "starforge ai-profile run --wasm ${workspaceFolder}/target/wasm32-unknown-unknown/release/contract.wasm",
+    "command": "starforge ai profiling run --wasm ${workspaceFolder}/target/__WASM_TARGET__/release/contract.wasm",
       "problemMatcher": []
     },
     {
       "label": "starforge: test maintenance",
       "type": "shell",
-      "command": "starforge ai-test-maintain analyze --source ${workspaceFolder}/src --tests ${workspaceFolder}/tests",
+      "command": "starforge ai test-maintain analyze --source ${workspaceFolder}/src --tests ${workspaceFolder}/tests",
       "problemMatcher": []
     }
   ]
@@ -594,17 +596,16 @@ const VSCODE_TASKS: &str = r#"{
 "#;
 
 const VSCODE_SETTINGS: &str = r#"{
-  "rust-analyzer.cargo.target": "wasm32-unknown-unknown",
   "rust-analyzer.check.command": "clippy",
   "starforge.ai.enabled": true,
   "starforge.ai.diagnosticsOnSave": true,
-  "starforge.ai.bridgeCommand": "starforge ai-ide request --kind diagnostics --stdin"
+  "starforge.ai.bridgeCommand": "starforge ai ide request --kind diagnostics --stdin"
 }
 "#;
 
 const INTELLIJ_AUDIT_RUN_CONFIG: &str = r#"<component name="ProjectRunConfigurationManager">
   <configuration default="false" name="Starforge Audit" type="ShConfigurationType">
-    <option name="SCRIPT_TEXT" value="starforge ai-audit src/lib.rs" />
+    <option name="SCRIPT_TEXT" value="starforge ai security-audit src/lib.rs" />
     <option name="INDEPENDENT_SCRIPT_PATH" value="true" />
     <option name="EXECUTE_IN_TERMINAL" value="true" />
     <method v="2" />
@@ -614,7 +615,7 @@ const INTELLIJ_AUDIT_RUN_CONFIG: &str = r#"<component name="ProjectRunConfigurat
 
 const INTELLIJ_PROFILE_RUN_CONFIG: &str = r#"<component name="ProjectRunConfigurationManager">
   <configuration default="false" name="Starforge Profile" type="ShConfigurationType">
-    <option name="SCRIPT_TEXT" value="starforge ai-profile run --wasm target/wasm32-unknown-unknown/release/contract.wasm" />
+    <option name="SCRIPT_TEXT" value="starforge ai profiling run --wasm target/__WASM_TARGET__/release/contract.wasm" />
     <option name="INDEPENDENT_SCRIPT_PATH" value="true" />
     <option name="EXECUTE_IN_TERMINAL" value="true" />
     <method v="2" />
@@ -647,12 +648,12 @@ const ZED_TASKS: &str = r#"[
   {
     "label": "starforge: AI audit",
     "command": "starforge",
-    "args": ["ai-audit", "$ZED_FILE"]
+    "args": ["ai", "security-audit", "$ZED_FILE"]
   },
   {
     "label": "starforge: AI profile",
     "command": "starforge",
-    "args": ["ai-profile", "run", "--wasm", "target/wasm32-unknown-unknown/release/contract.wasm"]
+    "args": ["ai", "profiling", "run", "--wasm", "target/__WASM_TARGET__/release/contract.wasm"]
   }
 ]
 "#;

@@ -18,6 +18,7 @@ on:
       - 'Cargo.lock'
       - 'benches/**'
       - '.github/workflows/benchmark-latency.yml'
+      - 'scripts/check-latency-budgets.sh'
   pull_request:
     paths:
       - '**.rs'
@@ -25,9 +26,14 @@ on:
       - 'Cargo.lock'
       - 'benches/**'
       - '.github/workflows/benchmark-latency.yml'
+      - 'scripts/check-latency-budgets.sh'
 
   # Allow manual trigger for ad-hoc budget checks.
   workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
 
 jobs:
   latency-budget:
@@ -51,11 +57,21 @@ jobs:
       # while still exercising cold-start and command-dispatch paths.
       - name: Run latency benchmarks
         run: |
-          cargo bench --locked -- \
-            cli_cold_start \
-            cli_command_latency \
-            latency_budget \
-            2>&1 | tee target/criterion/latency-bench-output.txt
+          mkdir -p target/criterion
+          # For PR CI, run only critical interactive hot paths to keep CI fast
+          # Criterion's harness takes a SINGLE positional filter, which it
+          # treats as a regex. Use one alternation to run multiple groups.
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # PR CI: Only critical interactive hot paths
+            cargo bench --locked -- \
+              'cli_cold_start_info|cli_cold_start_help|cli_wallet_list|cli_config_show|cli_info' \
+              2>&1 | tee target/criterion/latency-bench-output.txt
+          else
+            # Push to main: Full latency budget suite
+            cargo bench --locked -- \
+              'cli_cold_start|cli_command_latency|latency_budget' \
+              2>&1 | tee target/criterion/latency-bench-output.txt
+          fi
 
       # Parse Criterion output and check against latency budgets.
       # The check-latency-budgets.sh script extracts median values from the
@@ -64,22 +80,16 @@ jobs:
       - name: Parse and check latency budget report
         id: budget-check
         run: |
-          chmod +x scripts/check-latency-budgets.sh
-          REPORT=$(bash scripts/check-latency-budgets.sh \
-            --input target/criterion/latency-bench-output.txt \
-            --report-path target/criterion/latency-budget-report.json \
-            2>&1) || EXIT_CODE=$?
-          echo "::group::Latency Budget Report"
-          echo "$REPORT"
-          echo "::endgroup::"
-          ALL_PASS=$(echo "$REPORT" | jq -r '.all_pass')
-          echo "all_pass=$ALL_PASS" >> "$GITHUB_OUTPUT"
-          if [ "$ALL_PASS" = "false" ]; then
-            echo "❌ Latency budget violations detected!"
-            echo "failures=true" >> "$GITHUB_OUTPUT"
-            exit 1
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            bash scripts/check-latency-budgets.sh \
+              --input target/criterion/latency-bench-output.txt \
+              --report-path target/criterion/latency-budget-report.json \
+              --pr-mode
+          else
+            bash scripts/check-latency-budgets.sh \
+              --input target/criterion/latency-bench-output.txt \
+              --report-path target/criterion/latency-budget-report.json
           fi
-          echo "✅ All latency budgets met."
 
       - name: Upload Criterion report (artefact)
         if: always()
@@ -94,8 +104,14 @@ jobs:
             target/criterion/latency-budget-report.json
 
       # Post a PR comment with the budget check summary when run on a PR.
+      # Posting the summary is a courtesy, not the gate: the budget check step
+      # above is what fails the job. A `pull_request` from a fork gets a
+      # read-only GITHUB_TOKEN, so createComment returns 403
+      # ("Resource not accessible by integration"). That used to fail this job
+      # even when every budget passed.
       - name: Comment PR with budget summary
         if: github.event_name == 'pull_request' && always()
+        continue-on-error: true
         uses: actions/github-script@v7
         with:
           script: |
@@ -104,22 +120,34 @@ jobs:
             let summary = '## ⏱ CLI Latency Budget Check\n\n';
             if (fs.existsSync(reportPath)) {
               const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
-              let details = '';
+              summary += '| Status | Budget | Max (ms) | Actual (ms) | Result |\n';
+              summary += '|---|---|---:|---:|---|\n';
               for (const check of report.checks) {
                 const icon = check.status === 'PASS' ? '✅' :
                              check.status === 'FAIL' ? '❌' :
                              check.status === 'NOISY' ? '⚠️' :
                              check.status === 'SKIPPED' ? '⏭️' : '❗';
-                summary += `| ${icon} ${check.budget} | ${check.budget_max_ms} ms | ${check.actual_median_ms} ms | ${check.status} |\n`;
+                summary += `| ${icon} | ${check.budget} | ${check.budget_max_ms} | ${check.actual_median_ms} | ${check.status} |\n`;
               }
               if (report.any_fail) summary += '\n❌ **Some budgets were violated.**';
               else summary += '\n✅ **All budgets met.**';
             } else {
               summary += '_No latency budget report was generated._';
             }
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: summary
-            });
+            try {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: summary
+              });
+            } catch (error) {
+              // Fork PRs get a read-only GITHUB_TOKEN and can't post comments;
+              // don't fail the whole job just because the summary couldn't be posted.
+              core.warning(
+                `Could not post the latency budget comment (this is expected ` +
+                `for pull requests from forks, which get a read-only token): ` +
+                `${error.message}`
+              );
+              core.summary.addRaw(summary).write();
+            }

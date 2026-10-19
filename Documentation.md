@@ -102,8 +102,8 @@ Validate, size-check, and deploy compiled Soroban `.wasm` files to Testnet or Ma
 ### Build from source
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/starforge.git
-cd starforge
+git clone https://github.com/Nanle-code/StarForge.git
+cd StarForge
 cargo build --release
 
 # Move the binary to your PATH
@@ -321,3 +321,4 @@ MIT © 2025 — See [LICENSE](./LICENSE) for details.
 Built for the Stellar ecosystem.
 Participates in the [Stellar Wave Program](https://www.drips.network/wave/stellar) via [Drips](https://www.drips.network).
 Powered by the [Stellar Horizon API](https://developers.stellar.org/api/horizon) and [Soroban](https://soroban.stellar.org).
+..

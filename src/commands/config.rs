@@ -1,7 +1,11 @@
 use crate::utils::database;
-use crate::utils::{config, print as p};
+use crate::utils::{
+    config,
+    dry_run::{self, DryRunPlan, PlannedOperation},
+    output, print as p,
+};
 use anyhow::Result;
-use clap::{Args, Subcommand};
+use clap::Subcommand;
 
 #[derive(Subcommand)]
 pub enum ConfigCommands {
@@ -17,13 +21,13 @@ pub enum ConfigCommands {
     /// Set global wallet encryption parameters (Argon2id)
     SetEncryption {
         /// Argon2 memory cost in KiB (e.g. 65536)
-        #[arg(long)]
+        #[arg(long, hide = true)]
         mem: Option<u32>,
         /// Argon2 iteration count (e.g. 3)
-        #[arg(long)]
+        #[arg(long, hide = true)]
         iterations: Option<u32>,
         /// Argon2 parallelism factor (e.g. 4)
-        #[arg(long)]
+        #[arg(long, hide = true)]
         parallelism: Option<u32>,
         /// Reset to library defaults
         #[arg(long, default_value = "false")]
@@ -34,6 +38,23 @@ pub enum ConfigCommands {
     /// SQLite database management (init, migrate, query, backup, restore, export)
     #[command(subcommand)]
     Db(DbCommands),
+
+    // ── Commands moved under `config` by ADR 0007 ────────────────────────
+    // Each moved command keeps its own argument struct, so no flag definition
+    // is duplicated here; `handle` forwards to the owning module.
+    /// Show starforge config and environment info
+    Info,
+    /// Manage telemetry settings directly
+    #[command(subcommand)]
+    Telemetry(crate::commands::telemetry::TelemetryCommands),
+    /// Manage feature flags for AI features (rollouts, A/B tests, rollback)
+    Flags {
+        #[command(flatten)]
+        args: crate::commands::feature_flags_cmd::FeatureFlagsArgs,
+    },
+    /// Privacy protection, anonymization, consent, and reporting
+    #[command(subcommand)]
+    Privacy(crate::commands::privacy::PrivacyCommands),
 }
 
 #[derive(Subcommand)]
@@ -88,6 +109,11 @@ pub enum PluginTrustCommands {
 }
 
 pub async fn handle(cmd: ConfigCommands) -> Result<()> {
+    if dry_run::is_enabled() {
+        if let Some(plan) = dry_run_plan(&cmd) {
+            return plan.emit(output::is_json_mode_enabled());
+        }
+    }
     match cmd {
         ConfigCommands::Show => show(),
         ConfigCommands::Set { key, value } => set(&key, &value),
@@ -99,7 +125,141 @@ pub async fn handle(cmd: ConfigCommands) -> Result<()> {
         } => set_encryption(mem, iterations, parallelism, reset),
         ConfigCommands::Doctor => crate::commands::doctor::run().await,
         ConfigCommands::Db(cmd) => handle_db(cmd),
+        // ADR 0007: forward the commands that moved under `config`.
+        ConfigCommands::Info => crate::commands::info::handle().await,
+        ConfigCommands::Telemetry(cmd) => crate::commands::telemetry::handle(cmd).await,
+        ConfigCommands::Flags { args } => crate::commands::feature_flags_cmd::handle(args).await,
+        ConfigCommands::Privacy(cmd) => crate::commands::privacy::handle(cmd).await,
     }
+}
+
+/// Build the plan shown by `--dry-run` for a mutating `config` subcommand.
+///
+/// Read-only subcommands (`show`, `doctor`, `db query/status/check`) return
+/// `None` and run normally — a dry run of a read-only command is a no-op.
+fn dry_run_plan(cmd: &ConfigCommands) -> Option<DryRunPlan> {
+    let db_path = database::db_path();
+    let config_file = config::config_path();
+    let store_details = |operation: PlannedOperation| {
+        operation
+            .detail("Config file", config_file.display().to_string())
+            .detail("Database", db_path.display().to_string())
+    };
+
+    match cmd {
+        ConfigCommands::Set { key, value } => Some(
+            DryRunPlan::new(
+                "config set",
+                format!("Set configuration key '{key}' to '{value}'"),
+            )
+            .operation(store_details(PlannedOperation::new(
+                "config.write",
+                "configuration store",
+                format!("would persist '{key}' = '{value}'"),
+            )))
+            .writes_filesystem(),
+        ),
+        ConfigCommands::SetEncryption {
+            mem,
+            iterations,
+            parallelism,
+            reset,
+        } => {
+            let description = if *reset {
+                "would reset wallet encryption (Argon2id) parameters to defaults".to_string()
+            } else {
+                format!(
+                    "would update wallet encryption (Argon2id) parameters: mem={}, iterations={}, parallelism={}",
+                    option_label(*mem),
+                    option_label(*iterations),
+                    option_label(*parallelism),
+                )
+            };
+            Some(
+                DryRunPlan::new("config set-encryption", description.clone())
+                    .operation(store_details(PlannedOperation::new(
+                        "config.write",
+                        "wallet encryption parameters",
+                        description,
+                    )))
+                    .writes_filesystem(),
+            )
+        }
+        ConfigCommands::Db(DbCommands::Init) => Some(
+            DryRunPlan::new(
+                "config db init",
+                "Initialize the SQLite configuration database schema",
+            )
+            .operation(PlannedOperation::new(
+                "database.create",
+                db_path.display().to_string(),
+                "would create the SQLite schema (wallets, networks, config_kv, plugins, templates, meta)",
+            ))
+            .writes_filesystem(),
+        ),
+        ConfigCommands::Db(DbCommands::Migrate) => Some(
+            DryRunPlan::new(
+                "config db migrate",
+                "Migrate TOML configuration into the SQLite database",
+            )
+            .operation(
+                PlannedOperation::new(
+                    "database.write",
+                    db_path.display().to_string(),
+                    "would import wallets, networks, and config keys from TOML",
+                )
+                .detail("Source", config_file.display().to_string()),
+            )
+            .writes_filesystem(),
+        ),
+        ConfigCommands::Db(DbCommands::Backup { dest }) => Some(
+            DryRunPlan::new("config db backup", format!("Back up the database to {dest}"))
+                .operation(PlannedOperation::new(
+                    "file.write",
+                    dest.clone(),
+                    "would write a database backup file",
+                ))
+                .writes_filesystem(),
+        ),
+        ConfigCommands::Db(DbCommands::Restore { src }) => Some(
+            DryRunPlan::new(
+                "config db restore",
+                format!("Restore the database from {src}"),
+            )
+            .operation(PlannedOperation::new(
+                "database.write",
+                db_path.display().to_string(),
+                format!("would replace the database with the backup at {src}"),
+            ))
+            .writes_filesystem()
+            .warn("Restoring replaces the current database contents"),
+        ),
+        ConfigCommands::Db(DbCommands::Export { out: Some(out) }) => Some(
+            DryRunPlan::new(
+                "config db export",
+                format!("Export database contents to TOML at {out}"),
+            )
+            .operation(PlannedOperation::new(
+                "file.write",
+                out.clone(),
+                "would write the exported TOML file",
+            ))
+            .writes_filesystem(),
+        ),
+        ConfigCommands::Db(DbCommands::Export { out: None })
+        | ConfigCommands::Db(
+            DbCommands::Query { .. } | DbCommands::Status | DbCommands::Check,
+        )
+        | ConfigCommands::Show
+        | ConfigCommands::Doctor => None,
+        _ => None,
+    }
+}
+
+fn option_label<T: std::fmt::Display>(value: Option<T>) -> String {
+    value
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "unchanged".to_string())
 }
 
 fn handle_db(cmd: DbCommands) -> Result<()> {
@@ -288,7 +448,10 @@ fn db_check() -> Result<()> {
 }
 
 fn show() -> Result<()> {
-    let cfg = config::load()?;
+    // Show the *effective* config: user config with the project lockfile
+    // applied when one is discovered, so what the user sees is what the CLI
+    // uses in this directory (#805).
+    let cfg = crate::utils::project_config::load_effective()?;
     p::header("StarForge Configuration");
     p::separator();
 
@@ -296,10 +459,34 @@ fn show() -> Result<()> {
         "Config database",
         &database::db_path().display().to_string(),
     );
+    // Surface whether a project lockfile is participating, so an override is
+    // never mistaken for the user's own setting.
+    match crate::utils::project_config::find_and_load_project_lockfile(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    ) {
+        Ok(Some((path, _))) => p::kv(
+            "Project lockfile",
+            &format!("{} (project overrides applied)", path.display()),
+        ),
+        _ => p::kv("Project lockfile", "none found"),
+    }
     p::kv("Active network", &cfg.network);
     p::kv(
+        "network.ca_bundle",
+        &cfg.networks
+            .get(&cfg.network)
+            .and_then(|net| net.ca_bundle.clone())
+            .unwrap_or_else(|| "none".to_string()),
+    );
+    if let Some(overrides) = crate::utils::http_client::ca_bundle_from_env() {
+        p::kv(
+            &crate::utils::http_client::CA_BUNDLE_ENV_VAR,
+            &format!("{} (overrides the config)", overrides.display()),
+        );
+    }
+    p::kv(
         "Telemetry",
-        if cfg.telemetry_enabled.unwrap_or(true) {
+        if cfg.telemetry_enabled.unwrap_or(false) {
             "enabled"
         } else {
             "disabled"
@@ -307,7 +494,19 @@ fn show() -> Result<()> {
     );
     p::kv(
         "telemetry.enabled",
-        &cfg.telemetry_enabled.unwrap_or(true).to_string(),
+        &cfg.telemetry_enabled.unwrap_or(false).to_string(),
+    );
+    p::kv(
+        "Privacy mode",
+        if crate::utils::privacy::is_privacy_mode_enabled() {
+            "enabled (strict)"
+        } else {
+            "disabled"
+        },
+    );
+    p::kv(
+        "privacy.mode",
+        &cfg.privacy_mode.unwrap_or(false).to_string(),
     );
 
     println!();
@@ -327,11 +526,17 @@ fn show() -> Result<()> {
     Ok(())
 }
 
+// Not currently called from any code path in this crate. Kept rather than
+// removed since deleting it is a product decision, not a lint-scoping one.
+#[allow(dead_code)]
 fn set_value(key: &str, value: &str) -> Result<()> {
     let mut cfg = config::load()?;
     match key {
         "telemetry" | "telemetry.enabled" => {
             cfg.telemetry_enabled = Some(parse_bool(value)?);
+        }
+        "privacy" | "privacy.mode" => {
+            cfg.privacy_mode = Some(parse_bool(value)?);
         }
         "network" => {
             config::validate_network_exists(&cfg, value)?;
@@ -339,7 +544,7 @@ fn set_value(key: &str, value: &str) -> Result<()> {
         }
         _ => {
             anyhow::bail!(
-                "Unsupported config key '{}'. Supported keys: telemetry.enabled, network",
+                "Unsupported config key '{}'. Supported keys: telemetry.enabled, privacy.mode, network",
                 key
             );
         }
@@ -349,6 +554,9 @@ fn set_value(key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+// Not currently called from any code path in this crate. Kept rather than
+// removed since deleting it is a product decision, not a lint-scoping one.
+#[allow(dead_code)]
 fn parse_bool(value: &str) -> Result<bool> {
     match value.to_ascii_lowercase().as_str() {
         "true" | "1" | "yes" | "on" | "enabled" => Ok(true),
@@ -360,6 +568,9 @@ fn parse_bool(value: &str) -> Result<bool> {
     }
 }
 
+// Not currently called from any code path in this crate. Kept rather than
+// removed since deleting it is a product decision, not a lint-scoping one.
+#[allow(dead_code)]
 fn plugin_trust(cmd: PluginTrustCommands) -> Result<()> {
     match cmd {
         PluginTrustCommands::List => {
@@ -400,6 +611,9 @@ fn plugin_trust(cmd: PluginTrustCommands) -> Result<()> {
     Ok(())
 }
 
+// Not currently called from any code path in this crate. Kept rather than
+// removed since deleting it is a product decision, not a lint-scoping one.
+#[allow(dead_code)]
 fn print_plugin_trust_sources(cfg: &config::Config) {
     p::header("Trusted Plugin Sources");
     if cfg.plugin_trust.trusted_sources.is_empty() {
@@ -450,9 +664,16 @@ fn set_encryption(
 }
 
 fn set(key: &str, value: &str) -> Result<()> {
+    let normalized = key.trim().to_lowercase();
+
+    // String-valued keys come first: they are not booleans, so the boolean
+    // parsing below must not see them (#902).
+    if matches!(normalized.as_str(), "network.ca_bundle" | "ca_bundle") {
+        return set_ca_bundle(value);
+    }
+
     let mut cfg = config::load()?;
 
-    let normalized = key.to_lowercase();
     let enabled = match value.to_lowercase().as_str() {
         "true" | "1" | "on" | "yes" => true,
         "false" | "0" | "off" | "no" => false,
@@ -466,9 +687,63 @@ fn set(key: &str, value: &str) -> Result<()> {
             p::success(&format!("'{}' set to '{}'.", key, enabled));
             Ok(())
         }
+        "privacy" | "privacy.mode" => {
+            cfg.privacy_mode = Some(enabled);
+            config::save(&cfg)?;
+            p::success(&format!("'{}' set to '{}'.", key, enabled));
+            Ok(())
+        }
         _ => anyhow::bail!(
-            "Unsupported config key '{}'. Supported keys: telemetry.enabled",
+            "Unsupported config key '{}'. Supported keys: telemetry.enabled, privacy.mode, network.ca_bundle",
             key
         ),
     }
+}
+
+/// `starforge config set network.ca_bundle <path>` (#902).
+///
+/// The bundle is trusted for the *active* network: it adds root certificates to
+/// the platform store, which is what an internal Horizon/Soroban deployment
+/// behind a private CA needs. `none`, `clear` or `unset` removes it.
+///
+/// The file is parsed before it is stored, so a typo or a bundle with no
+/// certificates is reported here instead of by the next HTTPS request.
+fn set_ca_bundle(value: &str) -> Result<()> {
+    let mut cfg = config::load()?;
+    let network = cfg.network.clone();
+
+    let trimmed = value.trim();
+    let clearing = matches!(
+        trimmed.to_lowercase().as_str(),
+        "" | "none" | "clear" | "unset" | "default"
+    );
+
+    let requested = if clearing {
+        None
+    } else {
+        Some(std::path::PathBuf::from(trimmed))
+    };
+
+    let previous = config::set_network_ca_bundle(&mut cfg, &network, requested.clone())?;
+    config::save(&cfg)?;
+
+    match requested {
+        Some(path) => p::success(&format!(
+            "network.ca_bundle for '{}' set to '{}'.",
+            network,
+            path.display()
+        )),
+        None => match previous {
+            Some(previous) => p::success(&format!(
+                "network.ca_bundle for '{}' cleared (was '{}').",
+                network, previous
+            )),
+            None => p::info(&format!(
+                "network.ca_bundle for '{}' was already unset.",
+                network
+            )),
+        },
+    }
+
+    Ok(())
 }

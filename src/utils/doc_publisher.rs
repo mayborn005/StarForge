@@ -233,7 +233,8 @@ fn publish_http(
     let token_owned = auth_token.map(String::from);
     let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
     let (status_code, status_text) = rt.block_on(async move {
-        let client = reqwest::Client::new();
+        // #902: shared client (proxy, custom CA bundle, user agent).
+        let client = crate::utils::http_client::client().clone();
         let mut req = client
             .post(&endpoint_owned)
             .header("Content-Type", "application/gzip")
@@ -374,9 +375,7 @@ pub fn load_publish_log() -> Result<Vec<PublishRecord>> {
 }
 
 fn publish_log_path() -> Result<PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not determine home directory"))?;
-    let dir = home.join(".starforge").join("docs");
+    let dir = crate::utils::config::config_dir().join("docs");
     fs::create_dir_all(&dir)?;
     Ok(dir.join("publish_log.json"))
 }

@@ -86,9 +86,15 @@ pub fn redact_command(command: &str) -> String {
         }
 
         let lower = token.to_ascii_lowercase();
-        if ["--secret", "--secret-key", "--token", "--api-key", "--secret-key-file"]
-            .iter()
-            .any(|flag| lower == *flag)
+        if [
+            "--secret",
+            "--secret-key",
+            "--token",
+            "--api-key",
+            "--secret-key-file",
+        ]
+        .iter()
+        .any(|flag| lower == *flag)
         {
             output.push(token.to_string());
             redact_next = true;
@@ -123,7 +129,7 @@ mod tests {
     #[test]
     fn test_load_history_missing_file() {
         let temp_dir = TempDir::new().unwrap();
-        let result = load_history(&temp_dir.path().to_path_buf());
+        let result = load_history(temp_dir.path());
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 0);
     }
